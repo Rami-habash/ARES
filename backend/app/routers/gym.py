@@ -369,7 +369,7 @@ async def generate_report(session_id: int):
 
     recommendations = "Unable to generate recommendations."
     proc = await _asyncio.create_subprocess_exec(
-        "openshell", "-g", "nemoclaw", "sandbox", "exec", "-n", "nemo-ares", "--",
+        "openshell", "-g", "nemoclaw", "sandbox", "exec", "-n", "nemo", "--",
         "openclaw", "agent", "--to", "+report-recs", "--message", rec_msg, "--json",
         stdout=_asyncio.subprocess.PIPE,
         stderr=_asyncio.subprocess.PIPE,

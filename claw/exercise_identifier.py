@@ -64,7 +64,7 @@ REFS_PER_EXERCISE = 5
 VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
 EMBED_CACHE_ROOT  = Path(__file__).resolve().parent / "data" / "embeddings"
 
-OPENCLAW_SANDBOX    = "nemo-ares"
+OPENCLAW_SANDBOX    = "nemo"
 OPENCLAW_OOD_SESSION = "+10000000002"  # separate key from coaching so OOD queries don't bleed into coaching context
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ def _build_ood_prompt(
 def _ask_nemotron(prompt: str) -> list[str]:
     import json, re
 
-    logger.debug("Calling nemo-ares via openclaw for OOD candidate selection...")
+    logger.debug("Calling nemo via openclaw for OOD candidate selection...")
     cmd = [
         "openshell", "-g", "nemoclaw",
         "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",

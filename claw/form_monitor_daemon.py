@@ -323,7 +323,7 @@ async def broadcast_best_guess(patient_id: str, exercise: str | None, score: flo
 # Agent callback — sends events to the OpenClaw agent via openclaw CLI.
 # ---------------------------------------------------------------------------
 
-OPENCLAW_SANDBOX  = "nemo-ares"
+OPENCLAW_SANDBOX  = "nemo"
 OPENCLAW_SESSION  = "+10000000001"   # fixed number → stable session key
 BACKEND_BASE      = "http://localhost:8000"
 

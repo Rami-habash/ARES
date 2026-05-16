@@ -32,14 +32,14 @@ Two sandboxes on the VM:
 
 | Name      | Model                                       | Status  | Notes                     |
 |-----------|---------------------------------------------|---------|---------------------------|
-| nemo-ares | nvidia/nemotron-3-nano-omni-30b-a3b-reasoning | default | USE THIS — fast (~4-5s)  |
+| nemo | nvidia/nemotron-3-nano-omni-30b-a3b-reasoning | default | USE THIS — fast (~4-5s)  |
 | nemo-demo | nvidia/nemotron-3-super-120b-a12b            | old     | Ignore — 30s/response     |
 
 Key commands:
 ```bash
 nemoclaw list                        # list sandboxes
-nemoclaw nemo-ares status            # health check
-nemoclaw nemo-ares connect           # SSH into sandbox
+nemoclaw nemo status            # health check
+nemoclaw nemo connect           # SSH into sandbox
 openclaw tui                         # interactive chat (run inside sandbox)
 ```
 
@@ -57,7 +57,7 @@ Patient phone (/patient/* pages)
 
 form_monitor_daemon.py (runs on host)
   └── webcam → 2s clips → FormMonitor.tick → exercise/form events
-        └── openshell sandbox exec -n nemo-ares -- openclaw agent --to +10000000001 --message "..."
+        └── openshell sandbox exec -n nemo -- openclaw agent --to +10000000001 --message "..."
               └── Solstice agent (nano-30b) → 1-sentence coaching reply
                     ├── broadcast_coaching() → WS :8765 → frontend coaching feed
                     └── add_session_memory() → SQLite (claw/data/patients.db)
@@ -165,7 +165,7 @@ ARES/
 
 ---
 
-## The Solstice agent (OpenClaw in nemo-ares sandbox)
+## The Solstice agent (OpenClaw in nemo sandbox)
 
 **Workspace files** (in sandbox at /sandbox/.openclaw/workspace/):
 - AGENTS.md — behavioral rules, event handling, session_ended → report generation
@@ -178,7 +178,7 @@ ARES/
 
 **How the daemon talks to the agent:**
 ```bash
-openshell -g nemoclaw sandbox exec -n nemo-ares -- \
+openshell -g nemoclaw sandbox exec -n nemo -- \
   openclaw agent --to +10000000001 --message "[form_monitor] ..." --json
 ```
 Session key `+10000000001` is fixed so all form events share one conversation context.
@@ -230,7 +230,7 @@ but fails over `brev exec` (brev backgrounds stdin commands). Use Python subproc
 import subprocess
 content = open('claw/AGENTS.md').read()
 subprocess.run(
-    ['openshell', '-g', 'nemoclaw', 'sandbox', 'exec', '-n', 'nemo-ares', '--',
+    ['openshell', '-g', 'nemoclaw', 'sandbox', 'exec', '-n', 'nemo', '--',
      'sh', '-c', 'cat > /sandbox/.openclaw/workspace/AGENTS.md'],
     input=content, text=True, timeout=30
 )

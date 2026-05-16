@@ -10,7 +10,7 @@ warn()  { echo -e "${YELLOW}[warn]${NC}  $1"; }
 die()   { echo -e "${RED}[error]${NC} $1"; exit 1; }
 step()  { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
-SANDBOX_NAME="${SANDBOX_NAME:-nemo-ares}"
+SANDBOX_NAME="${SANDBOX_NAME:-nemo}"
 MODEL="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
