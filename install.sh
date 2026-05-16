@@ -26,4 +26,9 @@ pip3 install --quiet \
     uvicorn \
     kagglehub==1.0.1
 
+echo ""
+echo "Precomputing reference video embeddings..."
+cd NemoDemo && python3 precompute_embeddings.py
+cd ..
+
 echo "Done."
