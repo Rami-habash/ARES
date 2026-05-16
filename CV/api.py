@@ -22,9 +22,11 @@ import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 import identity
@@ -587,6 +589,42 @@ async def live_stop():
     _live["session"] = None
     _session_ready.clear()
     return {"status": "stopped"}
+
+
+@app.get("/live/mjpeg")
+async def live_mjpeg():
+    """MJPEG stream of the security camera feed. Consumable by cv2.VideoCapture."""
+    session = _live["session"]
+    if session is None:
+        raise HTTPException(status_code=503, detail="No live session running.")
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=30)
+
+    def on_raw_frame(frame: np.ndarray) -> None:
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, buf.tobytes())
+        except asyncio.QueueFull:
+            pass
+
+    unsubscribe = session.subscribe_raw(on_raw_frame)
+
+    async def generate():
+        try:
+            while True:
+                try:
+                    jpg = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    break
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        finally:
+            unsubscribe()
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.websocket("/live/ws")

@@ -9,20 +9,27 @@ export interface CoachingMessage {
 
 const WS_URL = process.env.NEXT_PUBLIC_COACHING_WS ?? 'ws://localhost:8765'
 
-export function useCoaching() {
+export function useCoaching(patientId: string | null) {
   const [latest, setLatest] = useState<CoachingMessage | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
+    setLatest(null)
+    if (!patientId) return
+
     let reconnectTimer: ReturnType<typeof setTimeout>
+    let stopped = false
 
     function connect() {
+      if (stopped) return
       const ws = new WebSocket(WS_URL)
       wsRef.current = ws
 
       ws.onmessage = (e) => {
         try {
-          const msg: CoachingMessage = { ...JSON.parse(e.data), ts: Date.now() }
+          const data = JSON.parse(e.data) as { patient_id: string; text: string }
+          if (data.patient_id !== patientId) return
+          const msg: CoachingMessage = { ...data, ts: Date.now() }
           setLatest(msg)
           if (typeof window !== 'undefined' && window.speechSynthesis) {
             window.speechSynthesis.cancel()
@@ -37,16 +44,17 @@ export function useCoaching() {
       }
 
       ws.onclose = () => {
-        reconnectTimer = setTimeout(connect, 2000)
+        if (!stopped) reconnectTimer = setTimeout(connect, 2000)
       }
     }
 
     connect()
     return () => {
+      stopped = true
       clearTimeout(reconnectTimer)
       wsRef.current?.close()
     }
-  }, [])
+  }, [patientId])
 
   return latest
 }

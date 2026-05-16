@@ -64,10 +64,14 @@ class _StreamWorker:
     frame_idx: int = 0
 
 
+RawFrameSubscriber = Callable[["np.ndarray"], None]
+
+
 class LiveSession:
     def __init__(self) -> None:
         self._streams: dict[str, _StreamWorker] = {}
         self._subscribers: list[Subscriber] = []
+        self._raw_subscribers: list[RawFrameSubscriber] = []
         self._sub_lock = threading.Lock()
         self._started_at: float | None = None
         self.identity = IdentityRegistry()
@@ -84,6 +88,27 @@ class LiveSession:
                     self._subscribers.remove(fn)
 
         return unsubscribe
+
+    def subscribe_raw(self, fn: RawFrameSubscriber) -> Callable[[], None]:
+        """Subscribe to raw security-stream frames (numpy BGR arrays)."""
+        with self._sub_lock:
+            self._raw_subscribers.append(fn)
+
+        def unsubscribe() -> None:
+            with self._sub_lock:
+                if fn in self._raw_subscribers:
+                    self._raw_subscribers.remove(fn)
+
+        return unsubscribe
+
+    def _emit_raw(self, frame: "np.ndarray") -> None:
+        with self._sub_lock:
+            subs = list(self._raw_subscribers)
+        for fn in subs:
+            try:
+                fn(frame)
+            except Exception:
+                log.exception("raw subscriber error")
 
     def _emit(self, frame: LiveFrame) -> None:
         with self._sub_lock:
@@ -167,6 +192,9 @@ class LiveSession:
                 ok, frame = worker.source.read()
                 if not ok or frame is None:
                     continue
+
+                if worker.name == SECURITY_STREAM:
+                    self._emit_raw(frame)
 
                 if not first_frame_logged:
                     log.info("[%s] first frame received (shape=%s)", worker.name, frame.shape)

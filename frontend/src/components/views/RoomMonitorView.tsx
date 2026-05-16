@@ -5,7 +5,6 @@ import LiveCameraCanvas from '@/components/room-monitor/LiveCameraCanvas'
 import LiveInspector from '@/components/room-monitor/LiveInspector'
 import { useLiveSecurityStream } from '@/hooks/useLiveSecurityStream'
 import { useGymSessions } from '@/hooks/useGymSessions'
-import { useCoachingFeed } from '@/hooks/useCoachingFeed'
 
 export default function RoomMonitorView() {
   const {
@@ -18,7 +17,6 @@ export default function RoomMonitorView() {
     handleVideoMetadata,
   } = useLiveSecurityStream('security')
   const { sessions, error: sessionsError } = useGymSessions()
-  const { messages: coachingMessages } = useCoachingFeed()
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null)
 
   return (
@@ -53,7 +51,6 @@ export default function RoomMonitorView() {
             sessionsError={sessionsError}
             selectedPatientId={selectedPatientId}
             onSelectPatient={setSelectedPatientId}
-            coachingMessages={coachingMessages}
           />
         </div>
       </div>

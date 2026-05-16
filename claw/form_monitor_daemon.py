@@ -77,13 +77,20 @@ def _capture_clip(cap: cv2.VideoCapture, fps: float, seconds: float) -> str | No
     return path
 
 
+def _open_capture(source: int | str) -> cv2.VideoCapture | None:
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        return None
+    return cap
+
+
 async def capture_loop(
     source: int | str,
     clip_queue: asyncio.Queue,
     stop_event: asyncio.Event,
 ):
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
+    cap = await asyncio.to_thread(_open_capture, source)
+    if cap is None:
         logger.error("Failed to open video source: %r", source)
         stop_event.set()
         return
@@ -94,9 +101,17 @@ async def capture_loop(
         while not stop_event.is_set():
             clip_path = await asyncio.to_thread(_capture_clip, cap, fps, CLIP_SECONDS)
             if clip_path is None:
-                logger.warning("Capture returned no frames; stopping.")
-                stop_event.set()
-                break
+                # Stream stalled (broadcast paused, patient out of frame, etc).
+                # Reconnect rather than dying — daemon outlives transient drops.
+                logger.warning("Capture stalled; reconnecting in 2s.")
+                cap.release()
+                await asyncio.sleep(2.0)
+                cap = await asyncio.to_thread(_open_capture, source)
+                if cap is None:
+                    logger.warning("Reconnect failed; will retry.")
+                    await asyncio.sleep(2.0)
+                    cap = cv2.VideoCapture("")  # placeholder so finally works
+                continue
             await clip_queue.put(clip_path)
     finally:
         cap.release()
@@ -411,10 +426,12 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # Cast --source: int if it's a digit, else resolve as a file path
-    # (must happen BEFORE chdir, otherwise the relative path breaks).
+    # Cast --source: int if digit, URL if http(s)://, else resolve as file path
+    # (file resolution must happen BEFORE chdir, otherwise relative paths break).
     if args.source.isdigit():
         source: int | str = int(args.source)
+    elif args.source.startswith("http://") or args.source.startswith("https://"):
+        source = args.source
     else:
         source = str(Path(args.source).resolve())
 

@@ -2,11 +2,12 @@
 import { useCoaching } from '@/hooks/useCoaching'
 
 interface Props {
+  patientId:   string
   patientName: string
 }
 
-export default function CoachingPanel({ patientName }: Props) {
-  const coaching = useCoaching()
+export default function CoachingPanel({ patientId, patientName }: Props) {
+  const coaching = useCoaching(patientId)
 
   return (
     <div className="bg-card rounded-xl border border-border p-5 shadow-sm flex flex-col gap-4">

@@ -22,7 +22,7 @@ export default function AppShell() {
     dashboard: <DashboardView setActiveView={setActiveView} setSelectedPatient={setSelectedPatient} demo={demo} />,
     'room-monitor': <RoomMonitorView />,
     patients: <PatientsView setActiveView={setActiveView} setSelectedPatient={setSelectedPatient} demo={demo} />,
-    exercise: <ExerciseDetailView selectedPatient={selectedPatient} />,
+    exercise: <ExerciseDetailView />,
     alerts: <AlertsView />,
     reports: <ReportsView selectedPatient={selectedPatient} />,
     'ai-assistant': <AIAssistantView />,
