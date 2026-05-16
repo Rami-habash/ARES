@@ -11,7 +11,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 ROOT_DIR = Path(__file__).resolve().parents[3]   # repo root
 
 # Single combined DB — clinical + app data in one place
-DB_PATH = ROOT_DIR / "NemoDemo" / "data" / "patients.db"
+DB_PATH = ROOT_DIR / "claw" / "data" / "patients.db"
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SECRET_KEY       = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_please")

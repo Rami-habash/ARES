@@ -42,6 +42,7 @@ from pathlib import Path
 import cv2
 
 from form_monitor import Event, FormMonitor, TickResult
+from patient_profile.profile import add_session_memory
 
 logger = logging.getLogger("form_monitor_daemon")
 
@@ -267,6 +268,10 @@ async def default_agent_callback(patient_id: str, result: TickResult):
                 reply = data.get("result", {}).get("payloads", [{}])[0].get("text", "")
                 print(f"  ← AGENT: {reply}")
                 await broadcast_coaching(patient_id, reply)
+                if result.event == Event.PATIENT_PAUSED and reply and not reply.startswith("⚠️"):
+                    exercise = result.exercise or "unknown"
+                    highlight = f"{exercise} | {reply}"
+                    await asyncio.to_thread(add_session_memory, patient_id, highlight)
             except Exception:
                 print(f"  ← AGENT (raw): {proc.stdout[:200]}")
         else:

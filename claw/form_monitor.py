@@ -165,13 +165,14 @@ class FormMonitor:
         # ── Patient is stationary ────────────────────────────────────────────
         if not moving:
             if self.state != State.WAITING:
-                prev = self.state
+                prev          = self.state
+                prev_exercise = self.current_exercise
                 self.state                   = State.WAITING
                 self.current_exercise        = None
                 self._last_comparison_notify = 0.0
                 return TickResult(
                     state=State.WAITING,
-                    exercise=None,
+                    exercise=prev_exercise,
                     comparison=None,
                     event=Event.PATIENT_PAUSED,
                     note=f"patient paused (was {prev.value})",

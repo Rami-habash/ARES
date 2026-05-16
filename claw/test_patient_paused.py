@@ -40,6 +40,7 @@ def main():
         r2 = monitor.tick(static)
         print(f"  state={r2.state.value}  event={r2.event}  note={r2.note!r}")
         assert r2.event == Event.PATIENT_PAUSED, f"Expected PATIENT_PAUSED, got {r2.event}"
+        assert r2.exercise == "squat", f"exercise field should carry through pause, got {r2.exercise!r}"
         assert monitor.state == State.WAITING
     finally:
         os.unlink(static)
