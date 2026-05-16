@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 NemoDemo/data/*.db
+.DS_Store
+*.mp4
+*.pt
+*.npy
+*.json
