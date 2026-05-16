@@ -50,6 +50,8 @@ if str(_CV_DIR) not in sys.path:
     sys.path.insert(0, str(_CV_DIR))
 
 import video_embeder  # noqa: E402
+import keypoint_extraction  # noqa: E402
+import form_analysis  # noqa: E402
 
 from patient_profile import KAGGLE_EXERCISES, get_patient_profile  # noqa: E402
 
@@ -61,6 +63,20 @@ logger = logging.getLogger(__name__)
 
 THRESHOLD         = 0.75
 REFS_PER_EXERCISE = 5
+# Weight of the pose-fingerprint score in the blended similarity. The remainder
+# (1 - POSE_WEIGHT) is the S3D embedding score. Pose dominates because S3D on
+# short uncontrolled clips is noisy; the keypoint signature (which joints moved
+# and by how much) is much more discriminating of WHICH exercise was performed.
+POSE_WEIGHT       = 0.7
+# Minimum number of visible joint groups (out of 5) required to even attempt
+# identification. Below this, the camera isn't seeing enough of the body to
+# distinguish exercises — surface "insufficient view" instead of guessing.
+MIN_VISIBLE_GROUPS = 2
+# Hard cap on OOD reasoning rounds per tick. Each round = 1 Nemotron call
+# (~5–10s) + scoring candidates, so without a cap a single misidentified
+# clip can lock the daemon up for minutes. The frontend broadcasts
+# best_guess/thinking only between ticks, so a long tick = a dead UI.
+MAX_OOD_ROUNDS    = 4
 VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
 EMBED_CACHE_ROOT  = Path(__file__).resolve().parent / "data" / "embeddings"
 
@@ -78,6 +94,16 @@ def _s3d():
     if _s3d_model is None:
         _s3d_model = video_embeder.load_model()
     return _s3d_model
+
+
+_pose_model_singleton = None
+
+def _pose_model():
+    """Lazy MediaPipe pose model for movement summaries."""
+    global _pose_model_singleton
+    if _pose_model_singleton is None:
+        _pose_model_singleton = keypoint_extraction.load_model()
+    return _pose_model_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +127,115 @@ def _embed(video_path: Path) -> np.ndarray:
     cache.parent.mkdir(parents=True, exist_ok=True)
     torch.save(torch.from_numpy(emb), cache)
     return emb
+
+
+# ---------------------------------------------------------------------------
+# Pose fingerprint — primary signal for exercise identification.
+#
+# A fingerprint is a 10-dim vector: 5 range_deg values + 5 mean_deg values,
+# one each for knees / hips / elbows / shoulders / ankles (left+right merged).
+# Range captures WHICH joints moved; mean captures posture (standing vs bent,
+# arms up vs down). Together these distinguish e.g. squat (knees+hips+ankles
+# moving, mid-range means) from leg extension (only knees moving, hip near 180°).
+#
+# Visibility is tracked per dimension: a joint group with no visible frames
+# gets NaN in both range and mean, and is masked out of similarity computations
+# rather than being compared as zero (which would falsely look like agreement
+# with another static-on-that-joint reference).
+# ---------------------------------------------------------------------------
+
+_FINGERPRINT_GROUPS: list[tuple[str, list[str]]] = [
+    ("knees",     ["left_knee",     "right_knee"]),
+    ("hips",      ["left_hip",      "right_hip"]),
+    ("elbows",    ["left_elbow",    "right_elbow"]),
+    ("shoulders", ["left_shoulder", "right_shoulder"]),
+    ("ankles",    ["left_ankle",    "right_ankle"]),
+]
+
+# Tolerances used to convert raw angle differences into a [0, 1] similarity.
+# A range diff of RANGE_TOL° (or a mean diff of MEAN_TOL°) drops that
+# dimension's similarity to 0.5; double that → ~0. Tuned so squat vs leg
+# extension (knee range ~80° vs ~80°, hip range ~60° vs ~5°) lands at a
+# meaningfully different score.
+_RANGE_TOL_DEG = 30.0
+_MEAN_TOL_DEG  = 40.0
+
+
+def _pose_cache_path(video_path: Path) -> Path:
+    try:
+        rel = video_path.relative_to(VIDEO_ROOT)
+    except ValueError:
+        rel = Path(video_path.name)
+    return EMBED_CACHE_ROOT / rel.parent / (rel.stem + ".pose.npy")
+
+
+def _group_range_and_mean(
+    joint_angles: dict[str, list[float]], names: list[str]
+) -> tuple[float, float]:
+    """Aggregate left/right joint angles into (range_deg, mean_deg).
+    Returns (nan, nan) if no visible frames across either joint."""
+    vals: list[float] = []
+    for joint in names:
+        for v in joint_angles.get(joint, []):
+            if v == v:  # not nan
+                vals.append(v)
+    if not vals:
+        return float("nan"), float("nan")
+    return max(vals) - min(vals), sum(vals) / len(vals)
+
+
+def _compute_fingerprint(video_path: Path) -> np.ndarray:
+    """10-dim pose fingerprint: 5 ranges + 5 means. NaN where not visible."""
+    try:
+        landmarks_seq = form_analysis.extract_reference_keypoints(
+            _pose_model(), str(video_path), bbox_model=None, num_frames=24,
+        )
+        if not any(landmarks_seq):
+            return np.full(10, np.nan, dtype=np.float32)
+        joint_angles = form_analysis.compute_joint_angles(landmarks_seq)
+    except Exception as exc:
+        logger.warning("Pose fingerprint failed for %s: %s", video_path.name, exc)
+        return np.full(10, np.nan, dtype=np.float32)
+
+    ranges: list[float] = []
+    means:  list[float] = []
+    for _, names in _FINGERPRINT_GROUPS:
+        r, m = _group_range_and_mean(joint_angles, names)
+        ranges.append(r)
+        means.append(m)
+    return np.array(ranges + means, dtype=np.float32)
+
+
+def _fingerprint(video_path: Path) -> np.ndarray:
+    """Pose fingerprint with disk cache, mirroring _embed()."""
+    cache = _pose_cache_path(video_path)
+    if cache.exists():
+        return np.load(cache)
+    fp = _compute_fingerprint(video_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache, fp)
+    return fp
+
+
+def _visible_group_count(fingerprint: np.ndarray) -> int:
+    """How many of the 5 joint groups have a usable (non-NaN) range value."""
+    return int(np.sum(~np.isnan(fingerprint[:5])))
+
+
+def _pose_similarity(query_fp: np.ndarray, ref_fp: np.ndarray) -> float:
+    """Visibility-masked similarity in [0, 1] between two fingerprints.
+
+    Each of the 10 dims contributes only if BOTH vectors have a non-NaN value
+    there. Per-dim similarity decays exponentially with the absolute angle
+    diff against the tolerance for that dim type (range vs mean). Returns NaN
+    if no dimensions overlap at all (e.g. query saw legs, ref saw arms only)."""
+    tols = np.array([_RANGE_TOL_DEG] * 5 + [_MEAN_TOL_DEG] * 5, dtype=np.float32)
+    valid = ~(np.isnan(query_fp) | np.isnan(ref_fp))
+    if not valid.any():
+        return float("nan")
+    diff = np.abs(query_fp[valid] - ref_fp[valid])
+    sims = np.exp(-diff / tols[valid])  # 0° → 1.0, tol° → ~0.37, 2*tol° → ~0.14
+    return float(np.mean(sims))
 
 
 def _exercise_has_videos(exercise_name: str) -> bool:
@@ -140,6 +275,89 @@ def _score_exercises(query_emb: np.ndarray, exercises: list[str]) -> dict[str, f
 
 
 # ---------------------------------------------------------------------------
+# Movement summary — gives Nemotron actual signal about WHAT the patient did
+# instead of just a column of cosine-similarity scores.
+# ---------------------------------------------------------------------------
+
+# Joints to summarise + their human-readable group. Pairs are described together
+# (the left/right means usually move in lockstep for symmetric exercises).
+_JOINT_GROUPS: list[tuple[str, list[str]]] = [
+    ("knees",     ["left_knee",     "right_knee"]),
+    ("hips",      ["left_hip",      "right_hip"]),
+    ("elbows",    ["left_elbow",    "right_elbow"]),
+    ("shoulders", ["left_shoulder", "right_shoulder"]),
+    ("ankles",    ["left_ankle",    "right_ankle"]),
+]
+
+# A joint counts as "moving" when its angle range over the clip exceeds this.
+_MOVEMENT_DEG_THRESHOLD = 15.0
+# Frames with this fraction of NaN angles are skipped when computing the range.
+_MIN_VISIBLE_FRAMES_RATIO = 0.25
+
+
+def _group_movement(joint_angles: dict[str, list[float]], names: list[str]) -> dict:
+    """Aggregate left/right joint pair into one row. Returns visibility + range."""
+    all_vals: list[float] = []
+    for joint in names:
+        for v in joint_angles.get(joint, []):
+            if v == v:  # not nan
+                all_vals.append(v)
+    if not all_vals:
+        return {"visible": False, "range_deg": 0.0, "mean_deg": 0.0}
+    return {
+        "visible":   True,
+        "range_deg": max(all_vals) - min(all_vals),
+        "mean_deg":  sum(all_vals) / len(all_vals),
+        "n_samples": len(all_vals),
+    }
+
+
+def summarize_movement(clip_path: str) -> str:
+    """Return a 1-line description of which joints moved and by how much.
+
+    Used in the OOD prompt so the LLM has actual movement context, not just
+    a score table. Quietly returns "Movement summary unavailable" on any
+    extraction error — never raises.
+    """
+    try:
+        landmarks_seq = form_analysis.extract_reference_keypoints(
+            _pose_model(), clip_path, bbox_model=None, num_frames=24,
+        )
+        if not any(landmarks_seq):
+            return "Movement summary: no pose detected (subject likely out of frame)."
+
+        joint_angles = form_analysis.compute_joint_angles(landmarks_seq)
+
+        # Visibility per group → tells the LLM what we COULDN'T see.
+        moving_groups:  list[str] = []
+        static_groups:  list[str] = []
+        hidden_groups:  list[str] = []
+        for label, names in _JOINT_GROUPS:
+            agg = _group_movement(joint_angles, names)
+            if not agg["visible"]:
+                hidden_groups.append(label)
+                continue
+            if agg["range_deg"] >= _MOVEMENT_DEG_THRESHOLD:
+                moving_groups.append(f"{label} (~{int(agg['range_deg'])}° range)")
+            else:
+                static_groups.append(f"{label} (~{int(agg['mean_deg'])}°, ±{int(agg['range_deg'])}°)")
+
+        parts: list[str] = []
+        if moving_groups:
+            parts.append("Moving: " + ", ".join(moving_groups))
+        else:
+            parts.append("No joints moved meaningfully.")
+        if static_groups:
+            parts.append("Static: " + ", ".join(static_groups))
+        if hidden_groups:
+            parts.append("Not visible: " + ", ".join(hidden_groups))
+        return "Movement summary — " + " | ".join(parts)
+    except Exception as exc:
+        logger.warning("Movement summary failed: %s", exc)
+        return "Movement summary unavailable."
+
+
+# ---------------------------------------------------------------------------
 # Nemotron 3 Nano reasoning
 # ---------------------------------------------------------------------------
 
@@ -147,6 +365,7 @@ def _build_ood_prompt(
     patient_exercises: list[str],
     all_scores: dict[str, float],
     already_tried: set[str],
+    movement_summary: str = "",
 ) -> str:
     scored_lines = "\n".join(
         f"  {ex}: {score:.4f}"
@@ -155,22 +374,30 @@ def _build_ood_prompt(
     untried = [e for e in KAGGLE_EXERCISES if e not in already_tried]
     catalog_str = ", ".join(untried)
 
+    movement_block = (
+        f"\n        Pose evidence from MediaPipe (joint angle ranges over the clip):\n"
+        f"        {movement_summary}\n"
+        if movement_summary else ""
+    )
+
     return textwrap.dedent(f"""
         A patient is performing an exercise. We tested several exercises
         against video embeddings and got these cosine similarity scores
         (threshold for a confident match = {THRESHOLD}):
 
         {scored_lines}
-
+        {movement_block}
         None matched. The exercise must be one of these untested options:
         {catalog_str}
 
         IMPORTANT:
-        - Embedding similarity is noisy. The actual exercise may have a
-          completely different movement pattern from the highest-scoring
-          tested exercises. Do NOT just pick exercises similar to the top
-          score — consider pushing, pulling, rotation, and upper-body
-          movements as well as lower-body.
+        - Use the pose evidence above as your PRIMARY signal — the embedding
+          scores are noisy. If knees + hips show large range and shoulders
+          are static, prefer lower-body exercises (squat, lunge variations,
+          deadlift). If shoulders + elbows show large range and lower body
+          is static, prefer upper-body exercises (push-up, shoulder press,
+          row variations). If "Not visible" lists the lower body, do NOT
+          suggest lower-body-dominant exercises.
         - Cover a diverse range of movement patterns in your picks.
 
         Output a JSON array of exactly 5 exercise names from the untested
@@ -188,12 +415,15 @@ def _ask_nemotron(prompt: str) -> list[str]:
     import json, re
 
     logger.debug("Calling nemo via openclaw for OOD candidate selection...")
+    # openshell sandbox exec rejects newlines in CLI args, so flatten the
+    # prompt to a single line. Collapse all whitespace runs to single spaces.
+    flat_prompt = re.sub(r"\s+", " ", prompt).strip()
     cmd = [
         "openshell", "-g", "nemoclaw",
         "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",
         "openclaw", "agent",
         "--to", OPENCLAW_OOD_SESSION,
-        "--message", prompt,
+        "--message", flat_prompt,
         "--json",
     ]
     try:
@@ -215,9 +445,15 @@ def _ask_nemotron(prompt: str) -> list[str]:
 
     logger.info("Nemotron OOD reply: %s", raw)
 
+    # Nemotron sometimes line-wraps inside a JSON string (e.g. "push\n-up"),
+    # which makes json.loads choke even though the intent is obviously
+    # "push-up". Strip raw line breaks before parsing — JSON strings don't
+    # permit them, so this can't damage a well-formed reply.
+    cleaned = raw.replace("\r", "").replace("\n", "")
+
     # Find all bracketed candidates; try them from longest to shortest so we
     # prefer the full answer array over any incidental list-like fragments.
-    matches = sorted(re.findall(r"\[[^\[\]]*\]", raw, re.DOTALL), key=len, reverse=True)
+    matches = sorted(re.findall(r"\[[^\[\]]*\]", cleaned, re.DOTALL), key=len, reverse=True)
     for m in matches:
         try:
             candidates = json.loads(m)
@@ -270,6 +506,11 @@ def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
     logger.info("[%s] Embedding query video...", patient_id)
     query_emb = _embed(Path(query_video_path))
 
+    # Pose summary gives the OOD reasoner real movement signal — without it
+    # the LLM only sees a score table and tends to give canned answers.
+    movement_summary = summarize_movement(query_video_path)
+    logger.info("[%s] %s", patient_id, movement_summary)
+
     # ── 1. In-domain pass ────────────────────────────────────────────────────
     in_domain = _available_exercises(profile.exercises)
     logger.info(
@@ -293,14 +534,15 @@ def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
 
     # ── 2. OOD reasoning loop ────────────────────────────────────────────────
     round_num = 0
-    while True:
+    while round_num < MAX_OOD_ROUNDS:
         round_num += 1
-        logger.info("[%s] OOD round %d", patient_id, round_num)
+        logger.info("[%s] OOD round %d/%d", patient_id, round_num, MAX_OOD_ROUNDS)
 
         prompt = _build_ood_prompt(
             patient_exercises=profile.exercises,
             all_scores=all_scores,
             already_tried=already_tried,
+            movement_summary=movement_summary,
         )
         candidates = _ask_nemotron(prompt)
 
