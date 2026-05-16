@@ -164,6 +164,10 @@ class TickResult:
     comparison: object | None    # raw output of compare_to_reference (any structure)
     event:      Event | None     # set when the agent should be notified
     note:       str              # human-readable summary for logs
+    # Top candidate from identify_exercise even when it didn't clear the
+    # threshold — lets the UI show the system's best guess in real time.
+    best_guess: str | None  = None
+    best_score: float | None = None
 
 
 class FormMonitor:
@@ -216,26 +220,34 @@ class FormMonitor:
             self.state = State.IDENTIFYING
 
             try:
-                ex = identify_exercise(self.patient_id, clip_path)
+                result = identify_exercise(self.patient_id, clip_path)
             except Exception as e:
                 logger.exception("identify_exercise failed")
                 return TickResult(State.IDENTIFYING, None, None, None,
                                   f"identify error: {e}")
 
-            if ex:
-                self.current_exercise        = ex
+            if result.exercise:
+                self.current_exercise        = result.exercise
                 self.state                   = State.MONITORING
                 self._last_comparison_notify = 0.0
                 return TickResult(
                     state=State.MONITORING,
-                    exercise=ex,
+                    exercise=result.exercise,
                     comparison=None,
                     event=Event.EXERCISE_IDENTIFIED,
-                    note=f"identified: {ex}",
+                    note=f"identified: {result.exercise} ({result.best_score:.2f})",
+                    best_guess=result.exercise,
+                    best_score=result.best_score,
                 )
 
-            return TickResult(State.IDENTIFYING, None, None, None,
-                              "motion detected, identifying…")
+            best_note = (
+                f"identifying — leading: {result.best_guess} ({result.best_score:.2f})"
+                if result.best_guess is not None
+                else "motion detected, identifying…"
+            )
+            return TickResult(State.IDENTIFYING, None, None, None, best_note,
+                              best_guess=result.best_guess,
+                              best_score=result.best_score)
 
         # ── MONITORING ───────────────────────────────────────────────────────
         try:
@@ -247,7 +259,8 @@ class FormMonitor:
 
         if data is None:
             return TickResult(self.state, self.current_exercise, None, None,
-                              f"{self.current_exercise} (no reference video found)")
+                              f"{self.current_exercise} (no reference video found)",
+                              best_guess=self.current_exercise)
 
         now = time.monotonic()
         due = now - self._last_comparison_notify >= COMPARISON_INTERVAL_SECS
@@ -259,7 +272,9 @@ class FormMonitor:
                 comparison=data,
                 event=Event.FORM_COMPARISON,
                 note=f"{self.current_exercise} comparison ready",
+                best_guess=self.current_exercise,
             )
 
         return TickResult(self.state, self.current_exercise, data, None,
-                          f"{self.current_exercise} monitoring")
+                          f"{self.current_exercise} monitoring",
+                          best_guess=self.current_exercise)

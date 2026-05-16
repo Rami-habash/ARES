@@ -2,6 +2,8 @@
 import { useEffect, useState } from 'react'
 import SectionLabel from '@/components/shared/SectionLabel'
 import CoachingPanel from '@/components/exercise/CoachingPanel'
+import LiveCameraCanvas from '@/components/room-monitor/LiveCameraCanvas'
+import { useLiveStream } from '@/components/providers/LiveStreamProvider'
 import { useGymSessions, type GymSession } from '@/hooks/useGymSessions'
 
 const stateLabel: Record<GymSession['state'], { text: string; classes: string }> = {
@@ -80,16 +82,18 @@ export default function ExerciseDetailView() {
 
 function PatientCoachingView({ session, onBack }: { session: GymSession; onBack: () => void }) {
   const tag = stateLabel[session.state]
-  return (
-    <div className="p-8 max-w-4xl mx-auto">
-      <button
-        onClick={onBack}
-        className="text-sm text-text-muted hover:text-text-primary mb-4"
-      >
-        ← Back to patients
-      </button>
+  const { mediaStream, latestFrame, sourceSize, status } = useLiveStream()
+  const broadcasting = status === 'broadcasting'
 
-      <div className="mb-6">
+  return (
+    <div className="flex flex-col h-full p-6 gap-4">
+      <div>
+        <button
+          onClick={onBack}
+          className="text-sm text-text-muted hover:text-text-primary mb-2"
+        >
+          ← Back to patients
+        </button>
         <SectionLabel>Exercise Detail</SectionLabel>
         <div className="flex items-center gap-3 mt-1">
           <h1 className="text-2xl font-bold text-text-primary font-mono">{session.patient_id}</h1>
@@ -102,7 +106,29 @@ function PatientCoachingView({ session, onBack }: { session: GymSession; onBack:
         </p>
       </div>
 
-      <CoachingPanel patientId={session.patient_id} patientName={session.patient_id} />
+      <div className="flex gap-4 flex-1 min-h-0">
+        <div className="flex-1 min-w-0 relative">
+          <LiveCameraCanvas
+            mediaStream={mediaStream}
+            latestFrame={latestFrame}
+            sourceSize={sourceSize}
+            selectedPatientId={session.patient_id}
+            filterPatientId={session.patient_id}
+            showKeypoints
+          />
+          {!broadcasting && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/60 rounded-lg pointer-events-none">
+              <p className="text-white/80 text-sm text-center px-6">
+                Camera broadcast is not running.<br />
+                Start it from the <span className="font-semibold">Room Monitor</span> tab.
+              </p>
+            </div>
+          )}
+        </div>
+        <div className="w-80 flex-shrink-0 overflow-auto">
+          <CoachingPanel patientId={session.patient_id} patientName={session.patient_id} />
+        </div>
+      </div>
     </div>
   )
 }

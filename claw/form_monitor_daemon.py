@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -46,26 +48,22 @@ from patient_profile.profile import add_session_memory
 
 logger = logging.getLogger("form_monitor_daemon")
 
-# Length of each tick's video clip, in seconds.
-CLIP_SECONDS = 2.0
+# Sliding-window capture: continuously fill a ring buffer with the last
+# WINDOW_SECONDS of frames; emit a clip every STEP_SECONDS containing the
+# whole window. This gives the exercise embedder multiple chances to catch
+# a complete rep cycle instead of arbitrarily slicing between reps.
+WINDOW_SECONDS = 4.0
+STEP_SECONDS   = 1.0
 
 
 # ---------------------------------------------------------------------------
 # Capture
 # ---------------------------------------------------------------------------
 
-def _capture_clip(cap: cv2.VideoCapture, fps: float, seconds: float) -> str | None:
-    """Read `seconds` worth of frames and write them to a temp .mp4. Blocking."""
-    n_frames = max(2, int(fps * seconds))
-    frames   = []
-    for _ in range(n_frames):
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            break
-        frames.append(frame)
+def _write_clip(frames: list, fps: float) -> str | None:
+    """Write the given frames to a temp .mp4 and return the path."""
     if len(frames) < 2:
         return None
-
     h, w = frames[0].shape[:2]
     fd, path = tempfile.mkstemp(suffix=".mp4", prefix="monitor_")
     os.close(fd)
@@ -84,37 +82,86 @@ def _open_capture(source: int | str) -> cv2.VideoCapture | None:
     return cap
 
 
+def _ring_capture(cap: cv2.VideoCapture,
+                  ring: collections.deque,
+                  ring_lock: threading.Lock,
+                  stall_event: threading.Event,
+                  thread_stop: threading.Event) -> None:
+    """Continuously read frames into the ring buffer until told to stop or the
+    source stalls. Runs in a dedicated thread so frame ingest is decoupled
+    from the asyncio loop that emits windows on a fixed cadence."""
+    while not thread_stop.is_set():
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            stall_event.set()
+            return
+        with ring_lock:
+            ring.append(frame)
+
+
 async def capture_loop(
     source: int | str,
     clip_queue: asyncio.Queue,
     stop_event: asyncio.Event,
 ):
-    cap = await asyncio.to_thread(_open_capture, source)
-    if cap is None:
-        logger.error("Failed to open video source: %r", source)
-        stop_event.set()
-        return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    logger.info("Capture started (source=%s, fps=%.1f, clip=%.1fs)", source, fps, CLIP_SECONDS)
+    while not stop_event.is_set():
+        cap = await asyncio.to_thread(_open_capture, source)
+        if cap is None:
+            logger.warning("Failed to open video source %r; retrying in 2s.", source)
+            await asyncio.sleep(2.0)
+            continue
 
-    try:
-        while not stop_event.is_set():
-            clip_path = await asyncio.to_thread(_capture_clip, cap, fps, CLIP_SECONDS)
-            if clip_path is None:
-                # Stream stalled (broadcast paused, patient out of frame, etc).
-                # Reconnect rather than dying — daemon outlives transient drops.
-                logger.warning("Capture stalled; reconnecting in 2s.")
-                cap.release()
-                await asyncio.sleep(2.0)
-                cap = await asyncio.to_thread(_open_capture, source)
-                if cap is None:
-                    logger.warning("Reconnect failed; will retry.")
-                    await asyncio.sleep(2.0)
-                    cap = cv2.VideoCapture("")  # placeholder so finally works
-                continue
-            await clip_queue.put(clip_path)
-    finally:
-        cap.release()
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        buffer_size = max(2, int(fps * WINDOW_SECONDS))
+        ring: collections.deque = collections.deque(maxlen=buffer_size)
+        ring_lock = threading.Lock()
+        stall_event = threading.Event()
+        thread_stop = threading.Event()
+
+        logger.info(
+            "Capture started (source=%s, fps=%.1f, window=%.1fs, step=%.1fs)",
+            source, fps, WINDOW_SECONDS, STEP_SECONDS,
+        )
+
+        capture_task = asyncio.create_task(asyncio.to_thread(
+            _ring_capture, cap, ring, ring_lock, stall_event, thread_stop,
+        ))
+
+        try:
+            while not stop_event.is_set() and not stall_event.is_set():
+                await asyncio.sleep(STEP_SECONDS)
+                with ring_lock:
+                    if len(ring) < buffer_size:
+                        continue
+                    frames_snapshot = list(ring)
+
+                clip_path = await asyncio.to_thread(_write_clip, frames_snapshot, fps)
+                if clip_path is None:
+                    continue
+
+                # If processing is behind, drop the oldest queued window so
+                # the next slot always carries the freshest 4 seconds.
+                if clip_queue.full():
+                    try:
+                        old = clip_queue.get_nowait()
+                        try:
+                            os.unlink(old)
+                        except OSError:
+                            pass
+                    except asyncio.QueueEmpty:
+                        pass
+                await clip_queue.put(clip_path)
+        finally:
+            thread_stop.set()
+            cap.release()
+            try:
+                await capture_task
+            except Exception:
+                pass
+
+        if stall_event.is_set() and not stop_event.is_set():
+            logger.warning("Capture stalled; reconnecting in 2s.")
+            await asyncio.sleep(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +193,19 @@ async def process_loop(
 
         ts = time.strftime("%H:%M:%S")
         print(f"[{ts}] {result.state.value:<12} {result.note}")
+
+        # Push every tick's reasoning to the UI so the user can see what the
+        # pipeline is thinking even between (or in absence of) coaching events.
+        try:
+            await broadcast_thinking(
+                monitor.patient_id,
+                f"{result.state.value} · {result.note}",
+            )
+            await broadcast_best_guess(
+                monitor.patient_id, result.best_guess, result.best_score,
+            )
+        except Exception:
+            logger.exception("trace broadcast failed; continuing")
 
         if result.event is not None:
             try:
@@ -228,15 +288,35 @@ async def _ws_handler(websocket) -> None:
         logger.info("Frontend disconnected (total=%d)", len(_ws_clients))
 
 
-async def broadcast_coaching(patient_id: str, text: str) -> None:
-    """Send a coaching message to all connected frontend clients."""
+async def _broadcast(payload: dict) -> None:
+    """Fan a dict out to every connected frontend client as JSON."""
     if not _ws_clients:
         return
-    payload = json.dumps({"patient_id": patient_id, "text": text})
+    raw = json.dumps(payload)
     await asyncio.gather(
-        *[ws.send(payload) for ws in list(_ws_clients)],
+        *[ws.send(raw) for ws in list(_ws_clients)],
         return_exceptions=True,
     )
+
+
+async def broadcast_coaching(patient_id: str, text: str) -> None:
+    """Final coaching reply from the agent — shown prominently in the UI."""
+    await _broadcast({"type": "coaching", "patient_id": patient_id, "text": text})
+
+
+async def broadcast_thinking(patient_id: str, text: str) -> None:
+    """Pipeline trace line — scrolls in the UI's activity log."""
+    await _broadcast({"type": "thinking", "patient_id": patient_id, "text": text})
+
+
+async def broadcast_best_guess(patient_id: str, exercise: str | None, score: float | None) -> None:
+    """Current top exercise candidate, even when below the match threshold."""
+    await _broadcast({
+        "type":       "best_guess",
+        "patient_id": patient_id,
+        "exercise":   exercise,
+        "score":      score,
+    })
 
 
 # ---------------------------------------------------------------------------

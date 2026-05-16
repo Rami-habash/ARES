@@ -4,7 +4,7 @@ tracker_type: botsort
 track_high_thresh: 0.6   # raise: only confident detections start/maintain tracks
 track_low_thresh: 0.1
 new_track_thresh: 0.7    # raise: fewer transient tracks from background false positives
-track_buffer: 30         # frames to keep a lost track around for re-id (~1s @ 30fps)
+track_buffer: 450        # frames to keep a lost track around for re-id (~15s @ 30fps); covers brief out-of-frame moments before our appearance ReID layer takes over
 match_thresh: 0.8
 fuse_score: True
 gmc_method: sparseOptFlow

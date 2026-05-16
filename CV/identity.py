@@ -55,11 +55,23 @@ CHECK_IN_MARKER_ID = 0          # the one marker the demo phone displays
 MARKER_PNG_SIZE_PX = 1000
 MARKER_QUIET_ZONE_PX = 200
 
-# Total "lost" budget: BoT-SORT keeps a track alive for ~2s after losing it
-# (track_buffer=60 in botsort.yaml, ~30 fps). After that, we wait an extra
-# 5s before declaring patient_lost — absorbs flaky reacquisitions. Result:
-# ~7s of total absence before the patient's phone is asked to show the marker.
+# Total "lost" budget: BoT-SORT keeps a track alive for ~15s after losing it
+# (track_buffer in botsort.yaml). After that, our appearance ReID layer tries
+# to re-bind on any unmatched new track using the saved HSV histogram. If
+# that fails for LOST_TIMEOUT_S, we declare patient_lost — at that point the
+# patient must show the marker again to recover.
 LOST_TIMEOUT_S = 5.0
+
+# Appearance ReID config. HSV histogram on the upper body region — ignore the
+# bottom of the bbox (floor/feet add noise) and the Value channel (lighting).
+_REID_TOP_FRAC      = 0.6   # use top 60% of bbox (head+torso) for the signature
+_REID_HUE_BINS      = 16
+_REID_SAT_BINS      = 16
+# Bhattacharyya distance: 0 = identical, 1 = totally different.
+# 0.45 is empirically a reasonable "different person" threshold for indoor
+# scenes with distinct clothing. Tune down if false positives bind strangers
+# to a patient, up if patients are missed after long absences.
+_REID_MATCH_THRESH  = 0.45
 
 EventType = Literal["patient_checked_in", "patient_lost", "patient_found"]
 
@@ -80,6 +92,10 @@ class _Binding:
     track_id:    int | None = None     # None while we're still waiting for the marker
     last_seen:   float = field(default_factory=time.time)
     lost:        bool = False
+    # HSV histogram captured the first time the marker bound this patient.
+    # Used to re-bind a new BoT-SORT track_id back to the patient when they
+    # re-enter frame after a long absence (no marker re-show required).
+    appearance:  np.ndarray | None = None
 
 
 class IdentityRegistry:
@@ -129,13 +145,18 @@ class IdentityRegistry:
         boxes: [(track_id, (x1, y1, x2, y2)), ...] — all current YOLO tracks.
         Detects ArUco markers in the frame, binds them to whichever box
         contains the marker center, and refreshes last_seen for every bound
-        track that is still in view.
+        track that is still in view. After the marker pass, any still-untagged
+        tracks are tested against saved appearance signatures so lost patients
+        can re-bind without re-showing the marker.
         """
         now = time.time()
         marker_to_track = self._aruco_to_track(frame, boxes)
+        box_lookup = {tid: xyxy for tid, xyxy in boxes}
 
         with self._lock:
             current_track_ids = {tid for tid, _ in boxes}
+            # Tracks already claimed by some patient (either before or during this frame).
+            claimed = {b.track_id for b in self._by_patient.values() if b.track_id is not None}
             events: list[IdentityEvent] = []
 
             for binding in self._by_patient.values():
@@ -146,6 +167,16 @@ class IdentityRegistry:
                         was_lost = binding.lost or binding.track_id is None
                         binding.track_id = new_tid
                         binding.last_seen = now
+                        claimed.add(new_tid)
+                        # Snapshot appearance when the marker first binds. We
+                        # keep the first signature so subsequent re-binds use
+                        # the clean reference frame the patient deliberately
+                        # presented; refreshing it on every sighting would let
+                        # drift accumulate.
+                        if binding.appearance is None and new_tid in box_lookup:
+                            sig = _compute_appearance(frame, box_lookup[new_tid])
+                            if sig is not None:
+                                binding.appearance = sig
                         if was_lost and binding.track_id is not None and not binding.lost:
                             # First-time bind: checked_in. Re-bind after lost: found.
                             events.append(IdentityEvent(
@@ -169,6 +200,47 @@ class IdentityRegistry:
                 # by BoT-SORT, even without the marker visible.
                 elif binding.track_id is not None and binding.track_id in current_track_ids:
                     binding.last_seen = now
+
+            # ── Appearance ReID pass ───────────────────────────────────────────
+            # For any lost binding with a saved signature, try to rebind to an
+            # unclaimed track in this frame. Greedy: each lost patient picks
+            # its single best match (if under threshold), each track can only
+            # be claimed once per frame.
+            lost_bindings = [
+                b for b in self._by_patient.values()
+                if b.lost and b.appearance is not None
+            ]
+            if lost_bindings:
+                unclaimed = [
+                    (tid, xyxy) for tid, xyxy in boxes if tid not in claimed
+                ]
+                for binding in lost_bindings:
+                    best_tid = None
+                    best_dist = _REID_MATCH_THRESH
+                    for tid, xyxy in unclaimed:
+                        sig = _compute_appearance(frame, xyxy)
+                        if sig is None:
+                            continue
+                        dist = float(cv2.compareHist(binding.appearance, sig, cv2.HISTCMP_BHATTACHARYYA))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_tid = tid
+                    if best_tid is not None:
+                        log.info(
+                            "appearance ReID: rebinding %s to track %d (dist=%.3f)",
+                            binding.patient_id, best_tid, best_dist,
+                        )
+                        binding.track_id = best_tid
+                        binding.last_seen = now
+                        binding.lost = False
+                        claimed.add(best_tid)
+                        unclaimed = [(t, x) for t, x in unclaimed if t != best_tid]
+                        events.append(IdentityEvent(
+                            type="patient_found",
+                            patient_id=binding.patient_id,
+                            track_id=best_tid,
+                            timestamp=now,
+                        ))
 
         for ev in events:
             self._emit(ev)
@@ -244,6 +316,35 @@ class IdentityRegistry:
 
     def stop(self) -> None:
         self._watcher_stop.set()
+
+
+# ── Appearance signature ──────────────────────────────────────────────────────
+
+def _compute_appearance(
+    frame: np.ndarray,
+    xyxy: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    """HSV (H,S) histogram of the upper-body crop, L1-normalized.
+
+    Returns None if the crop is empty / out-of-bounds. The returned array can
+    be compared with another via cv2.compareHist(... HISTCMP_BHATTACHARYYA).
+    """
+    x1, y1, x2, y2 = xyxy
+    h_box = y2 - y1
+    if h_box <= 4 or (x2 - x1) <= 4:
+        return None
+    y_cut = y1 + int(h_box * _REID_TOP_FRAC)
+    crop = frame[y1:y_cut, x1:x2]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist(
+        [hsv], [0, 1], None,
+        [_REID_HUE_BINS, _REID_SAT_BINS],
+        [0, 180, 0, 256],
+    )
+    cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+    return hist
 
 
 # ── Marker rendering ──────────────────────────────────────────────────────────

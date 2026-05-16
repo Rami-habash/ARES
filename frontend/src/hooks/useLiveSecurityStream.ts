@@ -2,8 +2,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { CV_BASE, CV_WS_BASE } from '@/lib/config'
 
+// Hoisted into a Provider at AppShell so the WebRTC broadcast + bbox WS
+// survive view navigation. Consumers attach `mediaStream` to their own
+// <video srcObject> — a single MediaStream can drive multiple video elements.
+
+// One MediaPipe landmark, normalized 0–1 within the bbox crop (NOT the source
+// frame). Map to source-frame pixels with: x1 + lm.x * (x2 - x1).
+export interface PoseLandmark {
+  x:          number
+  y:          number
+  z:          number
+  visibility: number
+}
+
 // One detection emitted by CV's /live/ws — kept minimal, no synthesised
 // patient state. `patient_id` is null until the ArUco binding fires.
+// `keypoints` is non-empty only for bound patients on the security stream.
 export interface LiveDetection {
   stream:       string
   frame_idx:    number
@@ -13,7 +27,7 @@ export interface LiveDetection {
   track_id:     number
   patient_id:   string | null
   bbox:         [number, number, number, number]   // x1, y1, x2, y2 in source-frame pixels
-  keypoints:    unknown[]
+  keypoints:    PoseLandmark[]
 }
 
 export interface LiveFrame {
@@ -39,7 +53,6 @@ export type BroadcastStatus =
 //  - the most recent LiveFrame for overlay rendering
 //  - source resolution so the overlay canvas can map bbox coords correctly
 export function useLiveSecurityStream(stream: string = 'security') {
-  const videoRef = useRef<HTMLVideoElement | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -49,6 +62,9 @@ export function useLiveSecurityStream(stream: string = 'security') {
   const [status, setStatus] = useState<BroadcastStatus>('idle')
   const [latestFrame, setLatestFrame] = useState<LiveFrame | null>(null)
   const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | null>(null)
+  // Re-render consumers when the local stream appears/disappears so each
+  // <video> can re-attach its srcObject.
+  const [mediaStream, setMediaStream] = useState<MediaStream | null>(null)
 
   // ── /live/ws subscriber — keeps running even when broadcast is stopped.
   // Reconnects on close so the viewer survives a CV restart or /live/stop call.
@@ -132,10 +148,7 @@ export function useLiveSecurityStream(stream: string = 'security') {
         audio: false,
       })
       localStreamRef.current = local
-      if (videoRef.current) {
-        videoRef.current.srcObject = local
-        // Resolution becomes known asynchronously via onloadedmetadata.
-      }
+      setMediaStream(local)
 
       setStatus('connecting')
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
@@ -173,12 +186,12 @@ export function useLiveSecurityStream(stream: string = 'security') {
     pcRef.current = null
     localStreamRef.current?.getTracks().forEach((t) => t.stop())
     localStreamRef.current = null
-    if (videoRef.current) videoRef.current.srcObject = null
+    setMediaStream(null)
     setStatus('stopped')
   }, [])
 
   // Clean up on unmount.
   useEffect(() => () => stop(), [stop])
 
-  return { videoRef, status, start, stop, latestFrame, sourceSize, handleVideoMetadata }
+  return { mediaStream, status, start, stop, latestFrame, sourceSize, handleVideoMetadata }
 }

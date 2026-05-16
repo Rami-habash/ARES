@@ -180,11 +180,14 @@ class LiveSession:
 
     def _run_stream(self, worker: _StreamWorker) -> None:
         bbox_model = pipeline._bbox()
-        run_pose = worker.name != SECURITY_STREAM
-        if run_pose:
-            pipeline._pose()  # warm
+        # Detail stream: pose on every track. Security stream: pose only on
+        # tracks already bound to a patient_id (Exercise Detail consumes these
+        # keypoints for its target-patient skeleton overlay).
+        run_pose = True
+        pose_all_tracks = worker.name != SECURITY_STREAM
+        pipeline._pose()  # warm regardless — both streams may run pose
 
-        log.info("[%s] worker started (pose=%s)", worker.name, run_pose)
+        log.info("[%s] worker started (pose=%s, pose_all=%s)", worker.name, run_pose, pose_all_tracks)
         first_frame_logged = False
 
         while not worker.stopped:
@@ -218,7 +221,12 @@ class LiveSession:
                     self.identity.observe_frame(frame, tracks)
 
                 for tid, (x1, y1, x2, y2) in tracks:
-                    if run_pose:
+                    patient_id = self.identity.patient_for_track(tid)
+                    # Skip pose on the security stream for unidentified tracks
+                    # — MediaPipe is the heaviest per-frame cost and Exercise
+                    # Detail only needs skeletons for known patients.
+                    should_pose = run_pose and (pose_all_tracks or patient_id is not None)
+                    if should_pose:
                         crop = frame[y1:y2, x1:x2]
                         keypoints = (
                             pipeline._landmarks_from_crop(crop, timestamp_ms)
@@ -235,7 +243,7 @@ class LiveSession:
                         frame_w=w,
                         frame_h=h,
                         track_id=tid,
-                        patient_id=self.identity.patient_for_track(tid),
+                        patient_id=patient_id,
                         bbox=(x1, y1, x2, y2),
                         keypoints=keypoints,
                     ))

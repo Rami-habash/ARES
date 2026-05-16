@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import textwrap
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -223,11 +224,27 @@ def _ask_nemotron(prompt: str) -> list[str]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
+@dataclass
+class IdentifyResult:
+    """Outcome of one identification pass.
+
+    `exercise` is set only when `best_score >= THRESHOLD`. `best_guess` and
+    `best_score` are always populated when at least one candidate was scored,
+    so the UI can surface the leading candidate even if it didn't clear the
+    bar.
+    """
+    exercise:   str | None
+    best_guess: str | None = None
+    best_score: float | None = None
+    all_scores: dict[str, float] = field(default_factory=dict)
+
+
+def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
     """Identify the exercise being performed in *query_video_path*.
 
-    Returns the matched exercise name, or None only if reference videos are
-    missing for all candidates (should not happen in a properly seeded setup).
+    Returns an IdentifyResult. `exercise` is the matched name, or None when
+    nothing cleared the confidence threshold — but `best_guess` always
+    reflects the top-scoring candidate so the caller can surface it.
     """
     profile = get_patient_profile(patient_id)
     if profile is None:
@@ -253,7 +270,10 @@ def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
         best_score = all_scores[best_ex]
         if best_score >= THRESHOLD:
             logger.info("[%s] In-domain match: %r (%.4f)", patient_id, best_ex, best_score)
-            return best_ex
+            return IdentifyResult(
+                exercise=best_ex, best_guess=best_ex, best_score=best_score,
+                all_scores=dict(all_scores),
+            )
         logger.info(
             "[%s] No in-domain match (best=%s %.4f). Entering OOD loop.",
             patient_id, best_ex, best_score,
@@ -298,7 +318,10 @@ def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
             best_score = round_scores[best_ex]
             if best_score >= THRESHOLD:
                 logger.info("[%s] OOD match: %r (%.4f)", patient_id, best_ex, best_score)
-                return best_ex
+                return IdentifyResult(
+                    exercise=best_ex, best_guess=best_ex, best_score=best_score,
+                    all_scores=dict(all_scores),
+                )
             logger.info(
                 "[%s] Round %d best: %s=%.4f — continuing.",
                 patient_id, round_num, best_ex, best_score,
@@ -310,4 +333,9 @@ def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
         patient_id,
         "\n".join(f"  {ex}: {score:.4f}" for ex, score in all_scores_sorted),
     )
-    return None
+    top_guess  = all_scores_sorted[0][0] if all_scores_sorted else None
+    top_score  = all_scores_sorted[0][1] if all_scores_sorted else None
+    return IdentifyResult(
+        exercise=None, best_guess=top_guess, best_score=top_score,
+        all_scores=dict(all_scores),
+    )

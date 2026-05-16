@@ -3,19 +3,18 @@ import { useState } from 'react'
 import SectionLabel from '@/components/shared/SectionLabel'
 import LiveCameraCanvas from '@/components/room-monitor/LiveCameraCanvas'
 import LiveInspector from '@/components/room-monitor/LiveInspector'
-import { useLiveSecurityStream } from '@/hooks/useLiveSecurityStream'
+import { useLiveStream } from '@/components/providers/LiveStreamProvider'
 import { useGymSessions } from '@/hooks/useGymSessions'
 
 export default function RoomMonitorView() {
   const {
-    videoRef,
+    mediaStream,
     status: broadcastStatus,
     start: startBroadcast,
     stop:  stopBroadcast,
     latestFrame,
     sourceSize,
-    handleVideoMetadata,
-  } = useLiveSecurityStream('security')
+  } = useLiveStream()
   const { sessions, error: sessionsError } = useGymSessions()
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null)
 
@@ -34,8 +33,7 @@ export default function RoomMonitorView() {
       <div className="flex gap-4 flex-1 min-h-0">
         <div className="flex-1 min-w-0">
           <LiveCameraCanvas
-            videoRef={videoRef}
-            onVideoMetadata={handleVideoMetadata}
+            mediaStream={mediaStream}
             latestFrame={latestFrame}
             sourceSize={sourceSize}
             selectedPatientId={selectedPatientId}

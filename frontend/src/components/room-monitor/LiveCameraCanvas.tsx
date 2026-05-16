@@ -3,13 +3,29 @@ import { useEffect, useRef } from 'react'
 import type { LiveFrame } from '@/hooks/useLiveSecurityStream'
 
 interface Props {
-  videoRef: React.RefObject<HTMLVideoElement | null>
-  onVideoMetadata: () => void
+  mediaStream: MediaStream | null
   latestFrame: LiveFrame | null
   sourceSize: { width: number; height: number } | null
   selectedPatientId: string | null
-  onSelectPatient: (id: string | null) => void
+  // Optional: when omitted, the canvas isn't clickable (used in Exercise
+  // Detail where the patient is already chosen by the route).
+  onSelectPatient?: (id: string | null) => void
+  // When set, only this patient's bbox is drawn (other dets hidden).
+  // Used by the Exercise Detail view to focus on one person.
+  filterPatientId?: string | null
+  // Draw MediaPipe skeleton on every visible detection that has keypoints.
+  // Combined with filterPatientId, this gives the target-patient-only view.
+  showKeypoints?: boolean
 }
+
+// MediaPipe Pose connections (matches CV/keypoint_extraction.py CONNECTIONS).
+const SKELETON_EDGES: [number, number][] = [
+  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [11, 23], [12, 24], [23, 24],
+  [23, 25], [25, 27], [24, 26], [26, 28],
+  [0, 11],  [0, 12],
+]
+const SKELETON_NODES = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
 
 const HUES = [200, 50, 320, 130, 20, 280]
 const colorFor = (tid: number) => `hsl(${HUES[tid % HUES.length]}, 80%, 60%)`
@@ -30,15 +46,27 @@ function visibleVideoRect(
 }
 
 export default function LiveCameraCanvas({
-  videoRef,
-  onVideoMetadata,
+  mediaStream,
   latestFrame,
   sourceSize,
   selectedPatientId,
   onSelectPatient,
+  filterPatientId = null,
+  showKeypoints = false,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+
+  // Attach the shared MediaStream to this instance's <video>. Multiple
+  // LiveCameraCanvas instances can mount concurrently (Room Monitor and
+  // Exercise Detail) and each gets its own srcObject pointing at the same
+  // stream — that's allowed by the spec.
+  useEffect(() => {
+    if (videoRef.current) {
+      videoRef.current.srcObject = mediaStream
+    }
+  }, [mediaStream])
 
   useEffect(() => {
     const draw = () => {
@@ -69,7 +97,10 @@ export default function LiveCameraCanvas({
       const sx = vis.width / sourceSize.width
       const sy = vis.height / sourceSize.height
 
-      const dets = latestFrame?.dets ?? []
+      const allDets = latestFrame?.dets ?? []
+      const dets = filterPatientId
+        ? allDets.filter(d => d.patient_id === filterPatientId)
+        : allDets
       for (const det of dets) {
         const [x1, y1, x2, y2] = det.bbox
         const color = colorFor(det.track_id)
@@ -88,6 +119,37 @@ export default function LiveCameraCanvas({
         ctx.fillRect(vis.left + x1 * sx, vis.top + y1 * sy - labelHeight, textWidth + padding * 2, labelHeight)
         ctx.fillStyle = '#000'
         ctx.fillText(label, vis.left + x1 * sx + padding, vis.top + y1 * sy - 5)
+
+        if (showKeypoints && det.keypoints.length > 0) {
+          // Keypoints are normalized 0–1 within the bbox crop; map to
+          // canvas pixels via the same letterboxing math as the bbox.
+          const bw = (x2 - x1) * sx
+          const bh = (y2 - y1) * sy
+          const bx = vis.left + x1 * sx
+          const by = vis.top + y1 * sy
+          const px = (lm: { x: number }) => bx + lm.x * bw
+          const py = (lm: { y: number }) => by + lm.y * bh
+
+          ctx.strokeStyle = '#34d399'  // emerald-400
+          ctx.lineWidth = 2
+          for (const [a, b] of SKELETON_EDGES) {
+            const la = det.keypoints[a]
+            const lb = det.keypoints[b]
+            if (!la || !lb || la.visibility < 0.3 || lb.visibility < 0.3) continue
+            ctx.beginPath()
+            ctx.moveTo(px(la), py(la))
+            ctx.lineTo(px(lb), py(lb))
+            ctx.stroke()
+          }
+          ctx.fillStyle = '#10b981'  // emerald-500
+          for (const idx of SKELETON_NODES) {
+            const lm = det.keypoints[idx]
+            if (!lm || lm.visibility < 0.3) continue
+            ctx.beginPath()
+            ctx.arc(px(lm), py(lm), 4, 0, Math.PI * 2)
+            ctx.fill()
+          }
+        }
       }
     }
 
@@ -95,9 +157,10 @@ export default function LiveCameraCanvas({
     const observer = new ResizeObserver(draw)
     if (containerRef.current) observer.observe(containerRef.current)
     return () => observer.disconnect()
-  }, [latestFrame, sourceSize, selectedPatientId])
+  }, [latestFrame, sourceSize, selectedPatientId, filterPatientId, showKeypoints])
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!onSelectPatient) return
     const container = containerRef.current
     if (!container || !sourceSize || !latestFrame) return
     const rect = container.getBoundingClientRect()
@@ -114,7 +177,6 @@ export default function LiveCameraCanvas({
     <div ref={containerRef} className="relative w-full h-full bg-black rounded-lg overflow-hidden">
       <video
         ref={videoRef}
-        onLoadedMetadata={onVideoMetadata}
         autoPlay
         muted
         playsInline
@@ -123,7 +185,7 @@ export default function LiveCameraCanvas({
       <canvas
         ref={canvasRef}
         onClick={handleClick}
-        className="absolute inset-0 w-full h-full cursor-pointer"
+        className={`absolute inset-0 w-full h-full ${onSelectPatient ? 'cursor-pointer' : ''}`}
       />
       <div className="absolute top-3 left-3 flex items-center gap-2 pointer-events-none z-10">
         <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />

@@ -10,6 +10,7 @@ import AlertsView from '@/components/views/AlertsView'
 import ReportsView from '@/components/views/ReportsView'
 import AIAssistantView from '@/components/views/AIAssistantView'
 import SettingsView from '@/components/views/SettingsView'
+import { LiveStreamProvider } from '@/components/providers/LiveStreamProvider'
 import { useDemoState } from '@/hooks/useDemoState'
 import type { NavItem } from '@/types'
 
@@ -30,22 +31,24 @@ export default function AppShell() {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar active={activeView} onNav={setActiveView} />
-      <main className="flex-1 overflow-auto bg-workspace">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeView}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.18 }}
-            className="h-full"
-          >
-            {views[activeView]}
-          </motion.div>
-        </AnimatePresence>
-      </main>
-    </div>
+    <LiveStreamProvider>
+      <div className="flex h-screen overflow-hidden">
+        <Sidebar active={activeView} onNav={setActiveView} />
+        <main className="flex-1 overflow-auto bg-workspace">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={activeView}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.18 }}
+              className="h-full"
+            >
+              {views[activeView]}
+            </motion.div>
+          </AnimatePresence>
+        </main>
+      </div>
+    </LiveStreamProvider>
   )
 }
