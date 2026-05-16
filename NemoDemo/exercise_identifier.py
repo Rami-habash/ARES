@@ -1,47 +1,48 @@
-"""Exercise identification via cosine-similarity embeddings + Nemotron 3 Nano reasoning.
+"""Exercise identification — hooks the CV pipeline to the patient profile store.
 
 Flow
 ----
 1. In-domain pass
-   Score every reference video assigned to the patient (from their profile).
-   If any video scores >= THRESHOLD, return that exercise name immediately.
+   Call pipeline.classify_movement with the patient's prescribed exercises as
+   the only reference videos on disk.  If it returns a prediction (score ≥ 0.75),
+   return that exercise name immediately.
 
 2. Out-of-domain (OOD) loop
-   Pass the accumulated scores to Nemotron 3 Nano and ask it to reason about
-   which untested catalog exercises to try next.
-   Score those candidates.  If a hit is found, return it.
-   Repeat until the model returns no new candidates (the exercise is always in
-   the Kaggle catalog, so this loop will terminate with a match).
+   Call pipeline.get_movement_context to get the full similarity scores.
+   Pass them to Nemotron 3 Nano, which reasons about which untested catalog
+   exercises to try next.  For each candidate batch, temporarily copy the
+   candidate videos into the reference dir so pipeline.classify_movement can
+   score them.  Repeat until a match is found.
 
-Similarity API contract (caller-provided)
-------------------------------------------
-The `similarity_fn` argument must be a callable:
+   The exercise is guaranteed to exist in the Kaggle catalog, so the loop
+   terminates with a match once the right exercise is reached.
 
-    similarity_fn(query_video_path: str, reference_video_path: str) -> float
-
-It returns a cosine-similarity score in [0, 1].  The implementation (embedding
-model, transport, caching) is managed externally — this module only calls it.
-
-Video layout on disk
----------------------
-    NemoDemo/data/videos/<exercise_name>/<any_name>.mp4
-
-The first .mp4 found in the exercise folder is used as the reference.
+Reference video layout (NemoDemo/data/videos/)
+----------------------------------------------
+Only the 11 exercises assigned across all patient profiles have folders here.
+The remaining 11 catalog exercises have no videos — that absence is what
+triggers the OOD path when a patient does something outside their prescription.
 """
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
+import shutil
+import sys
 import textwrap
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
-from openai import OpenAI  # NVIDIA NIM endpoint is OpenAI-compatible
+from openai import OpenAI
 
-from patient_profile import KAGGLE_EXERCISES, get_patient_profile
+# CV pipeline lives one level up in CV/
+_CV_DIR = Path(__file__).resolve().parent.parent / "CV"
+if str(_CV_DIR) not in sys.path:
+    sys.path.insert(0, str(_CV_DIR))
+
+import pipeline  # noqa: E402 — CV pipeline
+
+from patient_profile import KAGGLE_EXERCISES, get_patient_profile  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -49,55 +50,25 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-THRESHOLD = 0.75
+THRESHOLD    = 0.75
+VIDEO_ROOT   = Path(__file__).resolve().parent / "data" / "videos"
 
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NEMOTRON_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
-
-VIDEO_ROOT = Path(__file__).resolve().parent / "data" / "videos"
+NEMOTRON_MODEL  = "nvidia/nemotron-3-nano-30b-a3b"
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Reference dir helpers
 # ---------------------------------------------------------------------------
 
-SimilarityFn = Callable[[str, str], float]
-
-
-@dataclass
-class _Score:
-    exercise: str
-    video_path: str
-    score: float
-
-
-def _reference_video(exercise_name: str) -> str | None:
-    """Return path to the first .mp4 in the exercise's video folder, or None."""
+def _exercise_has_videos(exercise_name: str) -> bool:
     folder = VIDEO_ROOT / exercise_name
-    hits = glob.glob(str(folder / "*.mp4"))
-    return hits[0] if hits else None
+    return folder.is_dir() and any(folder.iterdir())
 
 
-def _score_exercises(
-    query_path: str,
-    exercise_names: list[str],
-    similarity_fn: SimilarityFn,
-) -> list[_Score]:
-    """Score a list of exercise names against the query video. Skips missing videos."""
-    results: list[_Score] = []
-    for name in exercise_names:
-        ref = _reference_video(name)
-        if ref is None:
-            logger.debug("No reference video for %r, skipping.", name)
-            continue
-        score = similarity_fn(query_path, ref)
-        logger.debug("  %s → %.4f", name, score)
-        results.append(_Score(exercise=name, video_path=ref, score=score))
-    return sorted(results, key=lambda s: s.score, reverse=True)
-
-
-def _best(scores: list[_Score]) -> _Score | None:
-    return scores[0] if scores else None
+def _available_exercises(names: list[str]) -> list[str]:
+    """Filter to exercises that actually have reference videos on disk."""
+    return [n for n in names if _exercise_has_videos(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -106,25 +77,24 @@ def _best(scores: list[_Score]) -> _Score | None:
 
 def _build_ood_prompt(
     patient_exercises: list[str],
-    all_scores_so_far: list[_Score],
+    all_scores: dict[str, float],
     already_tried: set[str],
-    kaggle_catalog: list[str],
 ) -> str:
     scored_lines = "\n".join(
-        f"  {s.exercise}: {s.score:.4f}" for s in all_scores_so_far
+        f"  {ex}: {score:.4f}" for ex, score in sorted(all_scores.items(), key=lambda x: -x[1])
     )
-    untried = [e for e in kaggle_catalog if e not in already_tried]
+    untried = [e for e in KAGGLE_EXERCISES if e not in already_tried]
     catalog_lines = "\n".join(f"  - {e}" for e in untried)
 
     return textwrap.dedent(f"""
         You are an expert exercise-recognition reasoning engine.
 
         A patient is performing a physical motion that could not be confidently
-        matched to any of their prescribed exercises. The cosine similarity
-        threshold for a confident match is {THRESHOLD}.
+        matched to any reference video. The cosine similarity threshold for a
+        confident match is {THRESHOLD}.
 
-        The exercise the patient is performing MUST be one of the exercises in
-        the untested catalog list below — it is guaranteed to be there.
+        The exercise MUST be one of the exercises in the untested catalog list
+        below — it is guaranteed to be there.
 
         ## Patient's prescribed exercises
         {', '.join(patient_exercises)}
@@ -136,53 +106,48 @@ def _build_ood_prompt(
         {catalog_lines}
 
         ## Your task
-        Think step-by-step about what the patient might be doing:
+        Think step-by-step:
 
-        1. Look at which exercises scored highest and what movement patterns
-           they share (e.g., leg drive, hip hinge, pushing, pulling, rotation,
-           isometric hold).
+        1. Examine which exercises scored highest and identify their shared
+           movement patterns (e.g. leg drive, hip hinge, pushing, pulling,
+           rotation, isometric hold, knee flexion, shoulder abduction).
         2. Consider which untested catalog exercises share those movement
            characteristics and could explain the observed similarity pattern.
         3. Think about biomechanical relationships: exercises that recruit the
            same muscle groups or share the same joint actions tend to produce
            similar embeddings.
         4. Rank the untested exercises from most to least likely to match.
-        5. Select up to 5 candidates to test next — prioritize exercises that
-           are most likely to cross the {THRESHOLD} threshold.
+        5. Select up to 5 candidates to test next — prioritize exercises most
+           likely to cross the {THRESHOLD} threshold.
 
         Respond ONLY with a JSON array of exercise names (strings) from the
         untested catalog list, ordered by priority.  Example:
         ["squat", "leg press", "romanian deadlift"]
 
-        Do not include exercises already tested. Do not add any commentary
+        Do not include already-tested exercises. Do not add any commentary
         outside the JSON array.
     """).strip()
 
 
 def _ask_nemotron(prompt: str) -> list[str]:
-    """Call Nemotron 3 Nano and parse a JSON list of exercise names from the reply."""
-    import json
-    import re
+    import json, re
 
     client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
-
     logger.debug("Calling Nemotron 3 Nano for OOD candidate selection...")
+
     response = client.chat.completions.create(
         model=NEMOTRON_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=512,
     )
-
     raw = response.choices[0].message.content or ""
-    logger.debug("Nemotron raw reply: %s", raw)
+    logger.debug("Nemotron reply: %s", raw)
 
-    # Extract the JSON array even if the model wraps it in markdown fences.
     match = re.search(r"\[.*?\]", raw, re.DOTALL)
     if not match:
-        logger.warning("Nemotron reply contained no JSON array; no candidates.")
+        logger.warning("Nemotron reply contained no JSON array.")
         return []
-
     try:
         candidates = json.loads(match.group())
         if not isinstance(candidates, list):
@@ -197,51 +162,56 @@ def _ask_nemotron(prompt: str) -> list[str]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def identify_exercise(
-    patient_id: str,
-    query_video_path: str,
-    similarity_fn: SimilarityFn,
-) -> str | None:
+def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
     """Identify the exercise being performed in *query_video_path*.
 
-    Returns the exercise name (str) on a confident match, or None if the
-    search is exhausted with no candidate returning a valid reference video.
+    Returns the matched exercise name, or None only if reference videos are
+    missing for all candidates (should not happen in a properly seeded setup).
     """
     profile = get_patient_profile(patient_id)
     if profile is None:
         raise ValueError(f"Unknown patient id: {patient_id!r}")
 
     kaggle_catalog = list(KAGGLE_EXERCISES)
-    already_tried: set[str] = set()
+    already_tried: set[str] = set(profile.exercises)
 
     # ── 1. In-domain pass ────────────────────────────────────────────────────
+    # Only score exercises that are both prescribed and have reference videos.
+    in_domain = _available_exercises(profile.exercises)
     logger.info(
-        "[%s] In-domain pass: scoring %d prescribed exercises.",
-        patient_id,
-        len(profile.exercises),
+        "[%s] In-domain pass: %d / %d prescribed exercises have reference videos.",
+        patient_id, len(in_domain), len(profile.exercises),
     )
-    in_domain_scores = _score_exercises(query_video_path, profile.exercises, similarity_fn)
-    already_tried.update(profile.exercises)
 
-    best = _best(in_domain_scores)
-    if best and best.score >= THRESHOLD:
-        logger.info(
-            "[%s] In-domain match: %r (%.4f)", patient_id, best.exercise, best.score
+    if in_domain:
+        result = pipeline.classify_movement(
+            query_video_path,
+            track_id=0,
+            reference_dir=str(VIDEO_ROOT),
+            min_confidence=THRESHOLD,
         )
-        return best.exercise
+        # classify_movement scores all exercises in VIDEO_ROOT; filter to patient's
+        all_scores: dict[str, float] = {
+            k: v for k, v in result["all_scores"].items() if k in profile.exercises
+        }
 
-    logger.info(
-        "[%s] No in-domain match (best=%.4f). Entering OOD reasoning loop.",
-        patient_id,
-        best.score if best else 0.0,
-    )
+        if result["prediction"] in profile.exercises:
+            logger.info(
+                "[%s] In-domain match: %r (%.4f)",
+                patient_id, result["prediction"], result["confidence"],
+            )
+            return result["prediction"]
 
-    # Accumulate all scores so the model has the full picture each round.
-    all_scores: list[_Score] = list(in_domain_scores)
+        best_score = max(all_scores.values()) if all_scores else 0.0
+        logger.info(
+            "[%s] No in-domain match (best=%.4f). Entering OOD reasoning loop.",
+            patient_id, best_score,
+        )
+    else:
+        logger.info("[%s] No in-domain reference videos found. Going straight to OOD.", patient_id)
+        all_scores = {}
 
     # ── 2. OOD reasoning loop ────────────────────────────────────────────────
-    # The exercise is guaranteed to be in the Kaggle catalog, so we keep going
-    # until Nemotron returns no new candidates (all untried options exhausted).
     round_num = 0
     while True:
         round_num += 1
@@ -249,48 +219,67 @@ def identify_exercise(
 
         prompt = _build_ood_prompt(
             patient_exercises=profile.exercises,
-            all_scores_so_far=all_scores,
+            all_scores=all_scores,
             already_tried=already_tried,
-            kaggle_catalog=kaggle_catalog,
         )
         candidates = _ask_nemotron(prompt)
 
-        # Only test exercises that are in the catalog and not yet tried.
         valid_candidates = [
-            c for c in candidates if c in kaggle_catalog and c not in already_tried
+            c for c in candidates
+            if c in kaggle_catalog and c not in already_tried
         ]
-
         if not valid_candidates:
-            # Model has no new ideas and all candidates are exhausted.
-            logger.info("[%s] No new valid candidates returned. Stopping.", patient_id)
+            logger.info("[%s] No new valid candidates. Stopping.", patient_id)
             break
 
-        logger.info("[%s] Testing candidates: %s", patient_id, valid_candidates)
-        round_scores = _score_exercises(query_video_path, valid_candidates, similarity_fn)
+        # Filter to candidates that actually have videos on disk.
+        testable = _available_exercises(valid_candidates)
         already_tried.update(valid_candidates)
-        all_scores.extend(round_scores)
 
-        best = _best(round_scores)
-        if best and best.score >= THRESHOLD:
-            logger.info(
-                "[%s] OOD match: %r (%.4f)", patient_id, best.exercise, best.score
+        if not testable:
+            logger.info("[%s] Candidates have no reference videos, skipping round.", patient_id)
+            continue
+
+        logger.info("[%s] Testing: %s", patient_id, testable)
+
+        # Stage: temporarily copy candidate videos into a scratch dir so
+        # classify_movement can score all of them in one pass without
+        # interfering with the permanent reference library.
+        scratch = VIDEO_ROOT.parent / "_ood_scratch"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+            for ex in testable:
+                shutil.copytree(VIDEO_ROOT / ex, scratch / ex, dirs_exist_ok=True)
+
+            result = pipeline.classify_movement(
+                query_video_path,
+                track_id=0,
+                reference_dir=str(scratch),
+                min_confidence=THRESHOLD,
             )
-            return best.exercise
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+            pipeline._ref_cache = None  # invalidate cache after scratch dir is gone
 
+        round_scores = {k: v for k, v in result["all_scores"].items() if k in testable}
+        all_scores.update(round_scores)
+
+        if result["prediction"] in testable:
+            logger.info(
+                "[%s] OOD match: %r (%.4f)", patient_id, result["prediction"], result["confidence"]
+            )
+            return result["prediction"]
+
+        best = max(round_scores.values()) if round_scores else 0.0
         logger.info(
-            "[%s] Round %d best: %s=%.4f — continuing.",
-            patient_id,
-            round_num,
-            best.exercise if best else "n/a",
-            best.score if best else 0.0,
+            "[%s] Round %d best: %.4f — continuing.", patient_id, round_num, best
         )
 
-    # All candidates exhausted without a match — should not happen in practice
-    # since the exercise is guaranteed to be in the catalog and have a video.
-    all_scores.sort(key=lambda s: s.score, reverse=True)
+    # All candidates exhausted without a match.
+    all_scores_sorted = sorted(all_scores.items(), key=lambda x: -x[1])
     logger.error(
         "[%s] Identification failed. Full score table:\n%s",
         patient_id,
-        "\n".join(f"  {s.exercise}: {s.score:.4f}" for s in all_scores),
+        "\n".join(f"  {ex}: {score:.4f}" for ex, score in all_scores_sorted),
     )
     return None
