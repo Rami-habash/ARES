@@ -60,6 +60,7 @@ for ex_dir in sorted(VIDEO_ROOT.iterdir()):
         print(f'  cached {v.name}')
 print('Embeddings ready.')
 "
+cd claw && python3 precompute_embeddings.py
 cd ..
 
 echo "Done."

@@ -2,7 +2,7 @@
 # Restore the nemo-ares sandbox to the Solstice workspace snapshot.
 set -euo pipefail
 
-SANDBOX="nemo-ares"
+SANDBOX="nemo"
 SNAPSHOT="with-solstice-workspace-v4"
 
 echo "Restoring $SANDBOX from snapshot '$SNAPSHOT'..."
