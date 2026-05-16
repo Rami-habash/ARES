@@ -89,17 +89,34 @@ else
     info "NemoClaw already installed: $(nemoclaw --version 2>/dev/null | head -1)"
 fi
 
+# Ensure nemoclaw is on PATH even if just installed
+export PATH="$HOME/.local/bin:$PATH"
+
 # ── Sandbox onboard ───────────────────────────────────────────────────────────
 step "NemoClaw sandbox"
 if nemoclaw list 2>/dev/null | grep -q "$SANDBOX_NAME"; then
     info "Sandbox '$SANDBOX_NAME' already exists, skipping onboard."
 else
     info "Onboarding sandbox '$SANDBOX_NAME'..."
-    info "When prompted: select 'nvidia-prod' as provider and pick:"
-    info "  $MODEL"
+    warn "When prompted: select 'nvidia-prod' as provider and pick:"
+    warn "  $MODEL"
     echo ""
     NVIDIA_API_KEY="$NVIDIA_API_KEY" nemoclaw onboard --name "$SANDBOX_NAME" \
         --yes-i-accept-third-party-software
+
+    info "Waiting for sandbox to be ready..."
+    for i in $(seq 1 30); do
+        if nemoclaw list 2>/dev/null | grep -q "$SANDBOX_NAME"; then
+            STATUS=$(nemoclaw "$SANDBOX_NAME" status 2>/dev/null | grep Phase | awk '{print $2}')
+            if [[ "$STATUS" == "Ready" ]]; then
+                info "Sandbox is ready."
+                break
+            fi
+        fi
+        echo -n "."
+        sleep 10
+    done
+    echo ""
 fi
 
 # ── Workspace files ───────────────────────────────────────────────────────────
