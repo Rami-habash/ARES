@@ -3,19 +3,13 @@ import { useEffect, useRef } from 'react'
 import type { LiveFrame } from '@/hooks/useLiveSecurityStream'
 
 interface Props {
-  mediaStream: MediaStream | null
   latestFrame: LiveFrame | null
   sourceSize: { width: number; height: number } | null
   selectedPatientId: string | null
-  // Optional: when omitted, the canvas isn't clickable (used in Exercise
-  // Detail where the patient is already chosen by the route).
   onSelectPatient?: (id: string | null) => void
-  // When set, only this patient's bbox is drawn (other dets hidden).
-  // Used by the Exercise Detail view to focus on one person.
   filterPatientId?: string | null
-  // Draw MediaPipe skeleton on every visible detection that has keypoints.
-  // Combined with filterPatientId, this gives the target-patient-only view.
   showKeypoints?: boolean
+  mjpegSrc?: string
 }
 
 // MediaPipe Pose connections (matches CV/keypoint_extraction.py CONNECTIONS).
@@ -46,27 +40,16 @@ function visibleVideoRect(
 }
 
 export default function LiveCameraCanvas({
-  mediaStream,
   latestFrame,
   sourceSize,
   selectedPatientId,
   onSelectPatient,
   filterPatientId = null,
   showKeypoints = false,
+  mjpegSrc = '/api/stream',
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-
-  // Attach the shared MediaStream to this instance's <video>. Multiple
-  // LiveCameraCanvas instances can mount concurrently (Room Monitor and
-  // Exercise Detail) and each gets its own srcObject pointing at the same
-  // stream — that's allowed by the spec.
-  useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.srcObject = mediaStream
-    }
-  }, [mediaStream])
 
   useEffect(() => {
     const draw = () => {
@@ -175,11 +158,12 @@ export default function LiveCameraCanvas({
 
   return (
     <div ref={containerRef} className="relative w-full h-full bg-black rounded-lg overflow-hidden">
-      <video
-        ref={videoRef}
-        autoPlay
-        muted
-        playsInline
+      {/* MJPEG stream from CV — shows what the camera actually sees regardless of whether
+          the broadcast source is the laptop webcam or a phone via WebRTC */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={mjpegSrc}
+        alt="live feed"
         className="absolute inset-0 w-full h-full object-contain"
       />
       <canvas

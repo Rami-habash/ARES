@@ -48,7 +48,7 @@ ARUCO_PARAMS.polygonalApproxAccuracyRate = 0.05   # accept slightly warped quads
 ARUCO_PARAMS.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 ARUCO_DETECTOR = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
 
-CHECK_IN_MARKER_ID = 0          # the one marker the demo phone displays
+CHECK_IN_MARKER_ID = 0          # fallback / default marker ID
 # Rendered PNG: 1000px of marker + 200px white quiet zone on each side.
 # Without the quiet zone the detector won't find the marker — phones with
 # rounded display corners or dark mode UI eat into it otherwise.
@@ -89,6 +89,7 @@ EventListener = Callable[[IdentityEvent], None]
 @dataclass
 class _Binding:
     patient_id:  str
+    marker_id:   int = CHECK_IN_MARKER_ID
     track_id:    int | None = None     # None while we're still waiting for the marker
     last_seen:   float = field(default_factory=time.time)
     lost:        bool = False
@@ -111,11 +112,11 @@ class IdentityRegistry:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def expect_check_in(self, patient_id: str) -> None:
+    def expect_check_in(self, patient_id: str, marker_id: int = CHECK_IN_MARKER_ID) -> None:
         """Start watching the marker for this patient. Idempotent."""
         with self._lock:
-            self._by_patient.setdefault(patient_id, _Binding(patient_id=patient_id))
-            log.info("expect_check_in %s — watching %d patients total", patient_id, len(self._by_patient))
+            self._by_patient.setdefault(patient_id, _Binding(patient_id=patient_id, marker_id=marker_id))
+            log.info("expect_check_in %s marker=%d — watching %d patients total", patient_id, marker_id, len(self._by_patient))
 
     def checkout(self, patient_id: str) -> None:
         """Drop the binding entirely; stop emitting events for this patient."""
@@ -161,8 +162,8 @@ class IdentityRegistry:
 
             for binding in self._by_patient.values():
                 # Marker observation — primary bind / re-bind signal.
-                if CHECK_IN_MARKER_ID in marker_to_track:
-                    new_tid = marker_to_track[CHECK_IN_MARKER_ID]
+                if binding.marker_id in marker_to_track:
+                    new_tid = marker_to_track[binding.marker_id]
                     if binding.track_id != new_tid:
                         was_lost = binding.lost or binding.track_id is None
                         binding.track_id = new_tid
@@ -262,8 +263,10 @@ class IdentityRegistry:
         if ids is None:
             return {}
         ids_flat = ids.flatten().tolist()
-        # Filter to the marker(s) we're actually watching for.
-        relevant = [(c, mid) for c, mid in zip(corners, ids_flat) if mid == CHECK_IN_MARKER_ID]
+        # Filter to only the marker IDs currently being watched across all patients.
+        with self._lock:
+            watched_ids = {b.marker_id for b in self._by_patient.values()}
+        relevant = [(c, mid) for c, mid in zip(corners, ids_flat) if mid in watched_ids]
         if not relevant:
             return {}
         out: dict[int, int] = {}

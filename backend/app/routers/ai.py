@@ -40,8 +40,8 @@ def _admin_context(query: str) -> str:
             exercises = [
                 r["name"] for r in conn.execute(
                     "SELECT e.name FROM exercises e JOIN patient_exercises pe ON pe.exercise_id=e.id "
-                    "WHERE pe.patient_id=?", (p["id"],)
-                )
+                    "WHERE pe.patient_id = %s", (p["id"],)
+                ).fetchall()
             ]
             rows.append(f"Patient {p['id']} ({p['name']}): {p['notes']}. Common exercises: {', '.join(exercises)}")
 
@@ -67,31 +67,31 @@ def _patient_context(user_id: int) -> tuple[str, str | None]:
     """Returns (system_prompt, patient_id | None)."""
     with get_conn() as conn:
         link = conn.execute(
-            "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user_id,)
+            "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user_id,)
         ).fetchone()
         if link is None:
             return "You are ARES, a physical therapy assistant. The user has no linked patient profile.", None
 
         pid = link["nemo_patient_id"]
-        row = conn.execute("SELECT id, name, notes FROM patients WHERE id=?", (pid,)).fetchone()
+        row = conn.execute("SELECT id, name, notes FROM patients WHERE id = %s", (pid,)).fetchone()
         exercises = [
             r["name"] for r in conn.execute(
                 "SELECT e.name FROM exercises e JOIN patient_exercises pe ON pe.exercise_id=e.id "
-                "WHERE pe.patient_id=?", (pid,)
-            )
+                "WHERE pe.patient_id = %s", (pid,)
+            ).fetchall()
         ]
         memories = [
             r["highlight"] for r in conn.execute(
-                "SELECT highlight FROM session_memories WHERE patient_id=? ORDER BY created_at DESC LIMIT 5",
+                "SELECT highlight FROM session_memories WHERE patient_id = %s ORDER BY created_at DESC LIMIT 5",
                 (pid,),
-            )
+            ).fetchall()
         ]
         sessions = conn.execute(
-            "SELECT session_date, form_score, summary FROM session_logs WHERE patient_id=? ORDER BY session_date DESC LIMIT 5",
+            "SELECT session_date, form_score, summary FROM session_logs WHERE patient_id = %s ORDER BY session_date DESC LIMIT 5",
             (pid,),
         ).fetchall()
         alerts = conn.execute(
-            "SELECT severity, title, description FROM alerts WHERE patient_id=? AND status='Open'",
+            "SELECT severity, title, description FROM alerts WHERE patient_id = %s AND status='Open'",
             (pid,),
         ).fetchall()
 

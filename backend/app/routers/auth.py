@@ -61,16 +61,17 @@ class TokenResponse(BaseModel):
 def register(body: RegisterRequest):
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM users WHERE email = ?", (body.email,)
+            "SELECT id FROM users WHERE email = %s", (body.email,)
         ).fetchone()
         if existing:
             raise HTTPException(status_code=400, detail="Email already registered")
 
-        cur = conn.execute(
-            "INSERT INTO users(email, name, password_hash, role) VALUES (?, ?, ?, ?)",
+        row = conn.execute(
+            "INSERT INTO users(email, name, password_hash, role) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (body.email, body.name, hash_password(body.password), body.role),
-        )
-        uid = cur.lastrowid
+        ).fetchone()
+        uid = row["id"]
 
     token = create_access_token({"sub": str(uid), "role": body.role})
     return TokenResponse(access_token=token, role=body.role, name=body.name, user_id=uid)
@@ -80,7 +81,7 @@ def register(body: RegisterRequest):
 def login(body: LoginRequest):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, name, role, password_hash FROM users WHERE email = ?",
+            "SELECT id, name, role, password_hash FROM users WHERE email = %s",
             (body.email,),
         ).fetchone()
 
@@ -154,15 +155,16 @@ async def google_callback(code: str):
     sub   = info["sub"]
 
     with get_conn() as conn:
-        row = conn.execute("SELECT id, name, role FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT id, name, role FROM users WHERE email = %s", (email,)).fetchone()
         if row is None:
-            cur = conn.execute(
-                "INSERT INTO users(email, name, role, oauth_sub) VALUES (?, ?, 'patient', ?)",
+            new_row = conn.execute(
+                "INSERT INTO users(email, name, role, oauth_sub) VALUES (%s, %s, 'patient', %s) "
+                "RETURNING id",
                 (email, name, sub),
-            )
-            uid, role = cur.lastrowid, "patient"
+            ).fetchone()
+            uid, role = new_row["id"], "patient"
         else:
-            conn.execute("UPDATE users SET oauth_sub = ? WHERE id = ?", (sub, row["id"]))
+            conn.execute("UPDATE users SET oauth_sub = %s WHERE id = %s", (sub, row["id"]))
             uid, role, name = row["id"], row["role"], row["name"]
 
     token = create_access_token({"sub": str(uid), "role": role})

@@ -5,6 +5,8 @@ flagged.  Admins see all alerts; patients see only their own.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -28,8 +30,12 @@ class UpdateAlertRequest(BaseModel):
 
 def _row_to_dict(row) -> dict:
     d = dict(row)
-    # Rename created_at → timestamp to match frontend Alert type
-    d["timestamp"] = d.pop("created_at")
+    # Rename created_at → timestamp to match frontend Alert type.
+    # Postgres returns a datetime; isoformat for JSON.
+    ts = d.pop("created_at")
+    if isinstance(ts, datetime):
+        ts = ts.isoformat()
+    d["timestamp"] = ts
     # Add patient_name stub (full name lookup handled by frontend or agent)
     d.setdefault("patient_name", d["patient_id"])
     return d
@@ -46,13 +52,13 @@ def list_alerts(user: dict = Depends(get_current_user)):
         else:
             # Patient: only their own alerts via patient_link
             link = conn.execute(
-                "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
+                "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
             ).fetchone()
             if link is None:
                 return {"alerts": []}
             rows = conn.execute(
                 "SELECT id, patient_id, severity, title, description, metric, status, created_at "
-                "FROM alerts WHERE patient_id = ? ORDER BY created_at DESC LIMIT 50",
+                "FROM alerts WHERE patient_id = %s ORDER BY created_at DESC LIMIT 50",
                 (link["nemo_patient_id"],),
             ).fetchall()
 
@@ -63,15 +69,11 @@ def list_alerts(user: dict = Depends(get_current_user)):
 def create_alert(body: CreateAlertRequest, user: dict = Depends(require_admin)):
     """Admin / agent layer — create a new alert."""
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO alerts(patient_id, severity, title, description, metric) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (body.patient_id, body.severity, body.title, body.description, body.metric),
-        )
         row = conn.execute(
-            "SELECT id, patient_id, severity, title, description, metric, status, created_at "
-            "FROM alerts WHERE id = ?",
-            (cur.lastrowid,),
+            "INSERT INTO alerts(patient_id, severity, title, description, metric) "
+            "VALUES (%s, %s, %s, %s, %s) "
+            "RETURNING id, patient_id, severity, title, description, metric, status, created_at",
+            (body.patient_id, body.severity, body.title, body.description, body.metric),
         ).fetchone()
 
     return _row_to_dict(row)
@@ -84,11 +86,10 @@ def update_alert(alert_id: int, body: UpdateAlertRequest, user: dict = Depends(r
         raise HTTPException(status_code=400, detail=f"status must be one of {allowed}")
 
     with get_conn() as conn:
-        conn.execute("UPDATE alerts SET status = ? WHERE id = ?", (body.status, alert_id))
         row = conn.execute(
-            "SELECT id, patient_id, severity, title, description, metric, status, created_at "
-            "FROM alerts WHERE id = ?",
-            (alert_id,),
+            "UPDATE alerts SET status = %s WHERE id = %s "
+            "RETURNING id, patient_id, severity, title, description, metric, status, created_at",
+            (body.status, alert_id),
         ).fetchone()
 
     if row is None:
@@ -99,4 +100,4 @@ def update_alert(alert_id: int, body: UpdateAlertRequest, user: dict = Depends(r
 @router.delete("/{alert_id}", status_code=204)
 def delete_alert(alert_id: int, user: dict = Depends(require_admin)):
     with get_conn() as conn:
-        conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        conn.execute("DELETE FROM alerts WHERE id = %s", (alert_id,))

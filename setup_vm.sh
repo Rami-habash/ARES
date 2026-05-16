@@ -152,11 +152,27 @@ else
     warn "No skills/ directory found"
 fi
 
-# ── Seed patient DB ───────────────────────────────────────────────────────────
-step "Seeding patient database"
-cd "$SCRIPT_DIR/claw"
-python3 -c "from patient_profile.profile import seed_db; seed_db(); print('DB seeded')"
-cd "$SCRIPT_DIR"
+# ── Seed Supabase Postgres ────────────────────────────────────────────────────
+step "Seeding Supabase Postgres database"
+
+# Load backend/.env so ARES_DB_URL is available even when not exported.
+if [[ -f "$SCRIPT_DIR/backend/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/backend/.env"
+    set +a
+fi
+
+if [[ -z "${ARES_DB_URL:-}" ]]; then
+    warn "ARES_DB_URL not set — skipping DB seed."
+    warn "  Copy backend/.env.example to backend/.env and fill in your Supabase"
+    warn "  connection string, then run:"
+    warn "    cd backend && python3 -m app.db.seed"
+else
+    cd "$SCRIPT_DIR/backend"
+    python3 -m app.db.seed && info "DB seeded"
+    cd "$SCRIPT_DIR"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""

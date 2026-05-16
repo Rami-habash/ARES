@@ -4,7 +4,7 @@ Admin view   — full list, all profiles, exercise assignment, blank-patient
                creation, doctor-note upload + Nemotron-driven risk profile.
 Patient view — own profile only (via patient_link).
 
-All data lives in the single combined DB (claw/data/patients.db).
+All data lives in the same Supabase Postgres project.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import textwrap
+from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -36,13 +37,20 @@ NEMOTRON_MODEL  = "nvidia/nemotron-3-nano-30b-a3b"
 _KAGGLE_SET = set(KAGGLE_EXERCISES)
 
 
+def _iso(v: Any) -> Any:
+    """Return ISO-formatted string for date/datetime values, pass through otherwise."""
+    if isinstance(v, (date, datetime)):
+        return v.isoformat()
+    return v
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _patient_with_sessions(patient_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, name, date_of_birth, notes, doctor_note, risk_profile_json "
-            "FROM patients WHERE id = ?",
+            "FROM patients WHERE id = %s",
             (patient_id,),
         ).fetchone()
         if row is None:
@@ -53,42 +61,45 @@ def _patient_with_sessions(patient_id: str) -> dict | None:
             for r in conn.execute(
                 "SELECT e.name FROM exercises e "
                 "JOIN patient_exercises pe ON pe.exercise_id = e.id "
-                "WHERE pe.patient_id = ? ORDER BY e.name",
+                "WHERE pe.patient_id = %s ORDER BY e.name",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
 
         memories = [
             {"created_at": r["created_at"], "highlight": r["highlight"]}
             for r in conn.execute(
                 "SELECT created_at, highlight FROM session_memories "
-                "WHERE patient_id = ? ORDER BY created_at DESC LIMIT 10",
+                "WHERE patient_id = %s ORDER BY created_at DESC LIMIT 10",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
 
         sessions = [
             dict(r)
             for r in conn.execute(
                 "SELECT session_date, form_score, summary, exercises_json "
-                "FROM session_logs WHERE patient_id = ? ORDER BY session_date DESC LIMIT 5",
+                "FROM session_logs WHERE patient_id = %s ORDER BY session_date DESC LIMIT 5",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
         for s in sessions:
-            s["exercises"] = json.loads(s.pop("exercises_json", "[]"))
+            s["exercises"] = json.loads(s.pop("exercises_json", "[]") or "[]")
+            s["session_date"] = _iso(s.get("session_date"))
 
         alerts = [
             dict(r)
             for r in conn.execute(
                 "SELECT id, severity, title, description, metric, status, created_at "
-                "FROM alerts WHERE patient_id = ? ORDER BY created_at DESC LIMIT 10",
+                "FROM alerts WHERE patient_id = %s ORDER BY created_at DESC LIMIT 10",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
+        for a in alerts:
+            a["created_at"] = _iso(a.get("created_at"))
 
         link = conn.execute(
-            "SELECT user_id FROM patient_links WHERE nemo_patient_id = ?",
+            "SELECT user_id FROM patient_links WHERE nemo_patient_id = %s",
             (patient_id,),
         ).fetchone()
 
@@ -118,7 +129,7 @@ def _patient_with_sessions(patient_id: str) -> dict | None:
 
 def _all_patient_ids() -> list[str]:
     with get_conn() as conn:
-        return [r["id"] for r in conn.execute("SELECT id FROM patients ORDER BY id")]
+        return [r["id"] for r in conn.execute("SELECT id FROM patients ORDER BY id").fetchall()]
 
 
 def _refresh_common_exercises_conn(patient_id: str, conn) -> None:
@@ -129,7 +140,7 @@ def _refresh_common_exercises_conn(patient_id: str, conn) -> None:
     """
     hot = conn.execute(
         "SELECT exercise_name FROM patient_exercise_counts "
-        "WHERE patient_id = ? AND session_count > 0 "
+        "WHERE patient_id = %s AND session_count > 0 "
         "ORDER BY session_count DESC, exercise_name ASC LIMIT 3",
         (patient_id,),
     ).fetchall()
@@ -138,22 +149,24 @@ def _refresh_common_exercises_conn(patient_id: str, conn) -> None:
     if len(chosen) < 3:
         cold = conn.execute(
             "SELECT exercise_name FROM patient_exercise_counts "
-            "WHERE patient_id = ? AND session_count = 0 "
+            "WHERE patient_id = %s AND session_count = 0 "
             "  AND exercise_name NOT IN (SELECT exercise_name FROM patient_exercise_counts "
-            "                            WHERE patient_id = ? AND session_count > 0) "
-            "ORDER BY exercise_name ASC LIMIT ?",
+            "                            WHERE patient_id = %s AND session_count > 0) "
+            "ORDER BY exercise_name ASC LIMIT %s",
             (patient_id, patient_id, 3 - len(chosen)),
         ).fetchall()
         chosen.extend(r["exercise_name"] for r in cold)
 
-    conn.execute("DELETE FROM patient_exercises WHERE patient_id = ?", (patient_id,))
+    conn.execute("DELETE FROM patient_exercises WHERE patient_id = %s", (patient_id,))
     for ex_name in chosen:
         conn.execute(
-            "INSERT OR IGNORE INTO exercises(name) VALUES (?)", (ex_name,),
+            "INSERT INTO exercises(name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+            (ex_name,),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO patient_exercises(patient_id, exercise_id) "
-            "SELECT ?, id FROM exercises WHERE name = ?",
+            "INSERT INTO patient_exercises(patient_id, exercise_id) "
+            "SELECT %s, id FROM exercises WHERE name = %s "
+            "ON CONFLICT DO NOTHING",
             (patient_id, ex_name),
         )
 
@@ -305,10 +318,10 @@ def create_patient(body: CreatePatientRequest, user: dict = Depends(require_admi
     new_id = "P" + uuid4().hex[:6].upper()
     with get_conn() as conn:
         # Vanishingly unlikely, but if the hex slice ever collides retry once.
-        if conn.execute("SELECT id FROM patients WHERE id = ?", (new_id,)).fetchone():
+        if conn.execute("SELECT id FROM patients WHERE id = %s", (new_id,)).fetchone():
             new_id = "P" + uuid4().hex[:6].upper()
         conn.execute(
-            "INSERT INTO patients(id, name, date_of_birth, notes) VALUES (?, ?, ?, ?)",
+            "INSERT INTO patients(id, name, date_of_birth, notes) VALUES (%s, %s, %s, %s)",
             (new_id, body.name, body.date_of_birth, body.notes or ""),
         )
     return {
@@ -327,7 +340,7 @@ def create_patient(body: CreatePatientRequest, user: dict = Depends(require_admi
 def my_profile(user: dict = Depends(get_current_user)):
     with get_conn() as conn:
         link = conn.execute(
-            "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
+            "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
         ).fetchone()
 
     if link is None:
@@ -340,9 +353,15 @@ def my_profile(user: dict = Depends(get_current_user)):
 
 
 @router.get("/{patient_id}")
-def get_patient(patient_id: str):
-    # Demo: unauthenticated, matching the /gym lifecycle endpoints. See the
-    # auth TODO in gym.py — patient-token auth is the same project for both.
+def get_patient(patient_id: str, user: dict = Depends(get_current_user)):
+    if user["role"] != "admin":
+        with get_conn() as conn:
+            link = conn.execute(
+                "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
+            ).fetchone()
+        if link is None or link["nemo_patient_id"] != patient_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
     profile = _patient_with_sessions(patient_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -356,14 +375,15 @@ def assign_exercises(
     user: dict = Depends(require_admin),
 ):
     with get_conn() as conn:
-        if not conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)).fetchone():
+        if not conn.execute("SELECT id FROM patients WHERE id = %s", (patient_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Patient not found")
 
-        conn.execute("DELETE FROM patient_exercises WHERE patient_id = ?", (patient_id,))
+        conn.execute("DELETE FROM patient_exercises WHERE patient_id = %s", (patient_id,))
         for ex_name in body.exercises:
             conn.execute(
-                "INSERT OR IGNORE INTO patient_exercises(patient_id, exercise_id) "
-                "SELECT ?, id FROM exercises WHERE name = ?",
+                "INSERT INTO patient_exercises(patient_id, exercise_id) "
+                "SELECT %s, id FROM exercises WHERE name = %s "
+                "ON CONFLICT DO NOTHING",
                 (patient_id, ex_name),
             )
 
@@ -377,11 +397,11 @@ def add_memory(
     user: dict = Depends(require_admin),
 ):
     with get_conn() as conn:
-        if not conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)).fetchone():
+        if not conn.execute("SELECT id FROM patients WHERE id = %s", (patient_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Patient not found")
         conn.execute(
             "INSERT INTO session_memories(patient_id, created_at, highlight) "
-            "VALUES (?, datetime('now'), ?)",
+            "VALUES (%s, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), %s)",
             (patient_id, body.highlight),
         )
     return {"status": "added"}
@@ -397,20 +417,20 @@ async def upload_doctor_note(
     resulting risk profile. Suggested exercises seed patient_exercise_counts
     at count=0 so real session data always outranks them."""
     with get_conn() as conn:
-        if not conn.execute("SELECT id FROM patients WHERE id = ?", (patient_id,)).fetchone():
+        if not conn.execute("SELECT id FROM patients WHERE id = %s", (patient_id,)).fetchone():
             raise HTTPException(status_code=404, detail="Patient not found")
 
     risk_profile = await _call_nemotron_for_note(body.note)
 
     with get_conn() as conn:
         conn.execute(
-            "UPDATE patients SET doctor_note = ?, risk_profile_json = ? WHERE id = ?",
+            "UPDATE patients SET doctor_note = %s, risk_profile_json = %s WHERE id = %s",
             (body.note, json.dumps(risk_profile), patient_id),
         )
         for ex_name in risk_profile.get("suggested_exercises", []):
             conn.execute(
-                "INSERT OR IGNORE INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
-                "VALUES (?, ?, 0)",
+                "INSERT INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
+                "VALUES (%s, %s, 0) ON CONFLICT (patient_id, exercise_name) DO NOTHING",
                 (patient_id, ex_name),
             )
         _refresh_common_exercises_conn(patient_id, conn)

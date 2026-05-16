@@ -28,7 +28,7 @@ def get_current_user(payload: dict = Depends(_token_payload)) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed token")
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, email, name, role FROM users WHERE id = ?", (user_id,)
+            "SELECT id, email, name, role FROM users WHERE id = %s", (int(user_id),)
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")

@@ -7,14 +7,7 @@ import { useLiveStream } from '@/components/providers/LiveStreamProvider'
 import { useGymSessions } from '@/hooks/useGymSessions'
 
 export default function RoomMonitorView() {
-  const {
-    mediaStream,
-    status: broadcastStatus,
-    start: startBroadcast,
-    stop:  stopBroadcast,
-    latestFrame,
-    sourceSize,
-  } = useLiveStream()
+  const { security } = useLiveStream()
   const { sessions, error: sessionsError } = useGymSessions()
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null)
 
@@ -33,18 +26,14 @@ export default function RoomMonitorView() {
       <div className="flex gap-4 flex-1 min-h-0">
         <div className="flex-1 min-w-0">
           <LiveCameraCanvas
-            mediaStream={mediaStream}
-            latestFrame={latestFrame}
-            sourceSize={sourceSize}
+            latestFrame={security.latestFrame}
+            sourceSize={security.sourceSize}
             selectedPatientId={selectedPatientId}
             onSelectPatient={setSelectedPatientId}
           />
         </div>
         <div className="w-72 bg-card border border-border rounded-xl overflow-hidden">
           <LiveInspector
-            broadcastStatus={broadcastStatus}
-            onStartBroadcast={startBroadcast}
-            onStopBroadcast={stopBroadcast}
             sessions={sessions}
             sessionsError={sessionsError}
             selectedPatientId={selectedPatientId}

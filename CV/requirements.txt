@@ -1,0 +1,17 @@
+# CV service dependencies
+# Install CUDA torch separately first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Then install this file:
+#   pip install -r requirements.txt
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+opencv-python-headless>=4.9.0
+ultralytics>=8.2.0
+mediapipe>=0.10.14
+numpy>=1.26.0
+lap>=0.4.0
+aiortc>=1.9.0
+websockets>=12.0
+httpx>=0.27.0
+python-multipart>=0.0.9

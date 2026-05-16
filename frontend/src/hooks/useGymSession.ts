@@ -1,6 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { API_BASE } from '@/lib/config'
+import { authHeaders } from '@/lib/api/auth'
 import type { GymSession } from './useGymSessions'
 
 // Single-session polling — drives the patient-facing screens. Returns null
@@ -14,7 +15,7 @@ export function useGymSession(sessionId: number | null, intervalMs: number = 100
     let stopped = false
     const tick = async () => {
       try {
-        const r = await fetch(`${API_BASE}/gym/${sessionId}`)
+        const r = await fetch(`${API_BASE}/gym/${sessionId}`, { headers: authHeaders() })
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const data: GymSession = await r.json()
         if (!stopped) {

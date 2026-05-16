@@ -1,13 +1,9 @@
 'use client'
 import { useState } from 'react'
 import type { GymSession } from '@/hooks/useGymSessions'
-import type { BroadcastStatus } from '@/hooks/useLiveSecurityStream'
 import { API_BASE } from '@/lib/config'
 
 interface Props {
-  broadcastStatus:   BroadcastStatus
-  onStartBroadcast:  () => void
-  onStopBroadcast:   () => void
   sessions:          GymSession[]
   sessionsError:     string | null
   selectedPatientId: string | null
@@ -21,27 +17,6 @@ const stateLabel: Record<GymSession['state'], { text: string; classes: string }>
   LEFT:        { text: 'Left',        classes: 'bg-slate-100 text-slate-600 border-slate-200' },
 }
 
-function BroadcastButton({ status, onStart, onStop }: {
-  status: BroadcastStatus; onStart: () => void; onStop: () => void
-}) {
-  if (status === 'broadcasting') {
-    return (
-      <button onClick={onStop} className="w-full rounded-md bg-slate-800 hover:bg-slate-900 text-white text-sm font-medium px-3 py-2">
-        Stop broadcast
-      </button>
-    )
-  }
-  const label =
-    status === 'requesting-camera' ? 'Requesting camera…' :
-    status === 'connecting'        ? 'Connecting…' : 'Start broadcast'
-  const disabled = status === 'requesting-camera' || status === 'connecting'
-  return (
-    <button onClick={onStart} disabled={disabled}
-      className="w-full rounded-md bg-accent-blue hover:opacity-90 disabled:opacity-50 text-white text-sm font-medium px-3 py-2">
-      {label}
-    </button>
-  )
-}
 
 function ReportModal({ patientId, report, onClose }: {
   patientId: string; report: string; onClose: () => void
@@ -68,12 +43,10 @@ function ReportModal({ patientId, report, onClose }: {
 }
 
 export default function LiveInspector({
-  broadcastStatus, onStartBroadcast, onStopBroadcast,
   sessions, sessionsError, selectedPatientId, onSelectPatient,
 }: Props) {
   const [generating, setGenerating] = useState<number | null>(null)
   const [report, setReport] = useState<{ patientId: string; text: string } | null>(null)
-  const errorMsg = typeof broadcastStatus === 'object' ? broadcastStatus.error : null
 
   const handleEndSession = async (session: GymSession, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -101,19 +74,6 @@ export default function LiveInspector({
       )}
 
       <div className="h-full flex flex-col">
-        <div className="px-4 py-3 border-b border-border">
-          <p className="text-xs font-semibold uppercase tracking-widest text-text-muted">Camera</p>
-          <div className="mt-2">
-            <BroadcastButton status={broadcastStatus} onStart={onStartBroadcast} onStop={onStopBroadcast} />
-          </div>
-          {errorMsg && <p className="mt-2 text-xs text-accent-red break-words">{errorMsg}</p>}
-          {broadcastStatus === 'idle' && (
-            <p className="mt-2 text-xs text-text-muted">
-              Click start to share this laptop&apos;s webcam as the room camera.
-            </p>
-          )}
-        </div>
-
         <div className="px-4 py-3 border-b border-border">
           <p className="text-xs font-semibold uppercase tracking-widest text-text-muted">Patients in room</p>
         </div>

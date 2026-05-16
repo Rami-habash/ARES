@@ -30,14 +30,21 @@ def list_users(user: dict = Depends(require_admin)):
             "FROM users u LEFT JOIN patient_links pl ON pl.user_id = u.id "
             "ORDER BY u.id"
         ).fetchall()
-    return {"users": [dict(r) for r in rows]}
+    # created_at is a datetime; isoformat for JSON.
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("created_at") is not None and not isinstance(d["created_at"], str):
+            d["created_at"] = d["created_at"].isoformat()
+        out.append(d)
+    return {"users": out}
 
 
 @router.get("/me")
 def me(user: dict = Depends(get_current_user)):
     with get_conn() as conn:
         link = conn.execute(
-            "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
+            "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
         ).fetchone()
     return {**user, "nemo_patient_id": link["nemo_patient_id"] if link else None}
 
@@ -46,12 +53,12 @@ def me(user: dict = Depends(get_current_user)):
 def link_patient(user_id: int, body: LinkPatientRequest, admin: dict = Depends(require_admin)):
     """Link a user account to a NemoDemo patient record."""
     with get_conn() as conn:
-        target = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = conn.execute("SELECT id FROM users WHERE id = %s", (user_id,)).fetchone()
         if target is None:
             raise HTTPException(status_code=404, detail="User not found")
         conn.execute(
-            "INSERT INTO patient_links(user_id, nemo_patient_id) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET nemo_patient_id=excluded.nemo_patient_id",
+            "INSERT INTO patient_links(user_id, nemo_patient_id) VALUES (%s, %s) "
+            "ON CONFLICT(user_id) DO UPDATE SET nemo_patient_id = EXCLUDED.nemo_patient_id",
             (user_id, body.nemo_patient_id),
         )
     return {"status": "linked", "user_id": user_id, "nemo_patient_id": body.nemo_patient_id}
@@ -62,8 +69,8 @@ def update_role(user_id: int, body: UpdateRoleRequest, admin: dict = Depends(req
     if body.role not in ("admin", "patient"):
         raise HTTPException(status_code=400, detail="role must be 'admin' or 'patient'")
     with get_conn() as conn:
-        target = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        target = conn.execute("SELECT id FROM users WHERE id = %s", (user_id,)).fetchone()
         if target is None:
             raise HTTPException(status_code=404, detail="User not found")
-        conn.execute("UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
+        conn.execute("UPDATE users SET role = %s WHERE id = %s", (body.role, user_id))
     return {"status": "updated", "user_id": user_id, "role": body.role}

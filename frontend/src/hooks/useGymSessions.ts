@@ -1,6 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { API_BASE } from '@/lib/config'
+import { authHeaders } from '@/lib/api/auth'
 
 export interface GymSession {
   id:          number
@@ -23,7 +24,7 @@ export function useGymSessions(intervalMs: number = 1500) {
     let stopped = false
     const tick = async () => {
       try {
-        const r = await fetch(`${API_BASE}/gym`)
+        const r = await fetch(`${API_BASE}/gym`, { headers: authHeaders() })
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const data: GymSession[] = await r.json()
         if (!stopped) {

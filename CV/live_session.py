@@ -71,7 +71,7 @@ class LiveSession:
     def __init__(self) -> None:
         self._streams: dict[str, _StreamWorker] = {}
         self._subscribers: list[Subscriber] = []
-        self._raw_subscribers: list[RawFrameSubscriber] = []
+        self._raw_subscribers: dict[str, list[RawFrameSubscriber]] = {}
         self._sub_lock = threading.Lock()
         self._started_at: float | None = None
         self.identity = IdentityRegistry()
@@ -89,21 +89,22 @@ class LiveSession:
 
         return unsubscribe
 
-    def subscribe_raw(self, fn: RawFrameSubscriber) -> Callable[[], None]:
-        """Subscribe to raw security-stream frames (numpy BGR arrays)."""
+    def subscribe_raw(self, fn: RawFrameSubscriber, stream: str = 'security') -> Callable[[], None]:
+        """Subscribe to raw frames from the named stream (numpy BGR arrays)."""
         with self._sub_lock:
-            self._raw_subscribers.append(fn)
+            self._raw_subscribers.setdefault(stream, []).append(fn)
 
         def unsubscribe() -> None:
             with self._sub_lock:
-                if fn in self._raw_subscribers:
-                    self._raw_subscribers.remove(fn)
+                subs = self._raw_subscribers.get(stream, [])
+                if fn in subs:
+                    subs.remove(fn)
 
         return unsubscribe
 
-    def _emit_raw(self, frame: "np.ndarray") -> None:
+    def _emit_raw(self, frame: "np.ndarray", stream: str = 'security') -> None:
         with self._sub_lock:
-            subs = list(self._raw_subscribers)
+            subs = list(self._raw_subscribers.get(stream, []))
         for fn in subs:
             try:
                 fn(frame)
@@ -183,11 +184,16 @@ class LiveSession:
         # Detail stream: pose on every track. Security stream: pose only on
         # tracks already bound to a patient_id (Exercise Detail consumes these
         # keypoints for its target-patient skeleton overlay).
-        run_pose = True
         pose_all_tracks = worker.name != SECURITY_STREAM
         pipeline._pose()  # warm regardless — both streams may run pose
 
-        log.info("[%s] worker started (pose=%s, pose_all=%s)", worker.name, run_pose, pose_all_tracks)
+        # Run YOLO every frame; run MediaPipe every POSE_STRIDE frames and
+        # carry the previous keypoints forward for the skipped frames.
+        # Detail stream needs higher stride because it runs pose on all tracks.
+        POSE_STRIDE = 2 if worker.name == SECURITY_STREAM else 3
+        cached_keypoints: dict[int, list] = {}  # tid → last computed keypoints
+
+        log.info("[%s] worker started (pose_all=%s, pose_stride=%d)", worker.name, pose_all_tracks, POSE_STRIDE)
         first_frame_logged = False
 
         while not worker.stopped:
@@ -196,8 +202,7 @@ class LiveSession:
                 if not ok or frame is None:
                     continue
 
-                if worker.name == SECURITY_STREAM:
-                    self._emit_raw(frame)
+                self._emit_raw(frame, stream=worker.name)
 
                 if not first_frame_logged:
                     log.info("[%s] first frame received (shape=%s)", worker.name, frame.shape)
@@ -205,6 +210,7 @@ class LiveSession:
 
                 h, w = frame.shape[:2]
                 timestamp_ms = int((time.time() - (self._started_at or time.time())) * 1000)
+                run_pose_this_frame = (worker.frame_idx % POSE_STRIDE) == 0
 
                 tracks: list[tuple[int, tuple[int, int, int, int]]] = []
                 for box in bounding_box.extract_bounding_boxes(bbox_model, frame, 0.5):
@@ -220,21 +226,24 @@ class LiveSession:
                 if worker.name == SECURITY_STREAM and tracks:
                     self.identity.observe_frame(frame, tracks)
 
+                live_tids = {tid for tid, _ in tracks}
+                for tid in list(cached_keypoints):
+                    if tid not in live_tids:
+                        del cached_keypoints[tid]
+
                 for tid, (x1, y1, x2, y2) in tracks:
                     patient_id = self.identity.patient_for_track(tid)
-                    # Skip pose on the security stream for unidentified tracks
-                    # — MediaPipe is the heaviest per-frame cost and Exercise
-                    # Detail only needs skeletons for known patients.
-                    should_pose = run_pose and (pose_all_tracks or patient_id is not None)
-                    if should_pose:
+                    should_pose = pose_all_tracks or patient_id is not None
+                    if should_pose and run_pose_this_frame:
                         crop = frame[y1:y2, x1:x2]
                         keypoints = (
                             pipeline._landmarks_from_crop(crop, timestamp_ms)
                             if crop.size > 0
                             else []
                         )
+                        cached_keypoints[tid] = keypoints
                     else:
-                        keypoints = []
+                        keypoints = cached_keypoints.get(tid, [])
 
                     self._emit(LiveFrame(
                         stream=worker.name,

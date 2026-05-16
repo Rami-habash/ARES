@@ -1,11 +1,11 @@
-"""Seed the combined DB with all demo data in one pass.
+"""Seed the Supabase Postgres DB with all demo data in one pass.
 
 Clinical data (patients, exercises, common-exercise counts) and app data
-(users, alerts, sessions) all go into the same DB at claw/data/patients.db.
+(users, alerts, sessions) all go into the same Postgres project.
 
 Usage:
-  cd backend && python -m app.db.seed           # safe to re-run (INSERT OR IGNORE)
-  cd backend && python -m app.db.seed --reset   # wipe app tables and re-seed
+  cd backend && python -m app.db.seed           # safe to re-run (ON CONFLICT DO NOTHING)
+  cd backend && python -m app.db.seed --reset   # wipe app + clinical tables and re-seed
 
 Demo credentials:
   admin@solstice.health / admin1234   (role=admin)
@@ -20,13 +20,12 @@ import json
 import sys
 
 # app.core.config injects claw/ onto sys.path so this import resolves.
-from app.core.config import DB_PATH  # noqa: F401  (also triggers path setup)
+from app.core.config import DB_URL  # noqa: F401  (also triggers path setup)
 from app.core.security import hash_password
 from app.db.database import get_conn, init_db
 from patient_profile.profile import (
     KAGGLE_EXERCISES,
     _refresh_common_exercises,
-    init_db as init_claw_db,
 )
 
 # ── Clinical data ─────────────────────────────────────────────────────────────
@@ -78,64 +77,76 @@ DEMO_SESSIONS = (
 
 
 def seed(reset: bool = False) -> None:
-    init_claw_db(DB_PATH)   # patients, exercises, patient_exercises, counts
-    init_db()               # ARES tables (users, alerts, session_logs, …)
+    init_db()  # creates all tables (clinical + app)
 
     with get_conn() as conn:
         if reset:
-            conn.executescript(
-                "DELETE FROM session_logs; DELETE FROM alerts; "
-                "DELETE FROM patient_links; DELETE FROM users; "
-                "DELETE FROM patient_exercise_counts; "
-                "DELETE FROM patient_exercises; DELETE FROM session_memories; "
-                "DELETE FROM patients; DELETE FROM exercises;"
-            )
+            # Order respects FKs: child tables first.
+            for stmt in (
+                "DELETE FROM session_logs;",
+                "DELETE FROM alerts;",
+                "DELETE FROM gym_sessions;",
+                "DELETE FROM patient_links;",
+                "DELETE FROM users;",
+                "DELETE FROM patient_exercise_counts;",
+                "DELETE FROM patient_exercises;",
+                "DELETE FROM session_memories;",
+                "DELETE FROM patients;",
+                "DELETE FROM exercises;",
+            ):
+                conn.execute(stmt)
 
         # Clinical data
-        conn.executemany(
-            "INSERT OR IGNORE INTO exercises(name) VALUES (?)",
-            [(name,) for name in KAGGLE_EXERCISES],
-        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO exercises(name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                [(name,) for name in KAGGLE_EXERCISES],
+            )
         for p in DEMO_PATIENTS:
             conn.execute(
-                "INSERT OR IGNORE INTO patients(id, name, date_of_birth, notes) VALUES (?, ?, ?, ?)",
+                "INSERT INTO patients(id, name, date_of_birth, notes) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (p["id"], p["name"], p["date_of_birth"], p["notes"]),
             )
             counts = DEMO_EXERCISE_COUNTS.get(p["id"], {})
             for ex_name, count in counts.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (patient_id, exercise_name) DO NOTHING",
                     (p["id"], ex_name, count),
                 )
             _refresh_common_exercises(p["id"], conn)
 
         # App data
         for u in DEMO_USERS:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO users(email, name, password_hash, role) VALUES (?, ?, ?, ?)",
+            # Plain ON CONFLICT DO NOTHING wouldn't RETURNING a row on conflict;
+            # do a no-op UPDATE so we always get the id back.
+            row = conn.execute(
+                "INSERT INTO users(email, name, password_hash, role) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email "
+                "RETURNING id",
                 (u["email"], u["name"], hash_password(u["password"]), u["role"]),
-            )
-            uid = cur.lastrowid or conn.execute(
-                "SELECT id FROM users WHERE email = ?", (u["email"],)
-            ).fetchone()["id"]
+            ).fetchone()
+            uid = row["id"]
             if u["patient_id"]:
                 conn.execute(
-                    "INSERT OR IGNORE INTO patient_links(user_id, nemo_patient_id) VALUES (?, ?)",
+                    "INSERT INTO patient_links(user_id, nemo_patient_id) VALUES (%s, %s) "
+                    "ON CONFLICT (user_id) DO UPDATE SET nemo_patient_id = EXCLUDED.nemo_patient_id",
                     (uid, u["patient_id"]),
                 )
 
         for a in DEMO_ALERTS:
             conn.execute(
-                "INSERT OR IGNORE INTO alerts(patient_id, severity, title, description, metric, status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO alerts(patient_id, severity, title, description, metric, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
                 (a["patient_id"], a["severity"], a["title"], a["description"], a["metric"], a["status"]),
             )
 
         for s in DEMO_SESSIONS:
             conn.execute(
-                "INSERT OR IGNORE INTO session_logs(patient_id, session_date, exercises_json, form_score, summary) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO session_logs(patient_id, session_date, exercises_json, form_score, summary) "
+                "VALUES (%s, %s, %s, %s, %s)",
                 (s["patient_id"], s["session_date"], json.dumps(s["exercises"]), s["form_score"], s["summary"]),
             )
 

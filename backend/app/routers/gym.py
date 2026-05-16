@@ -20,7 +20,9 @@ import json
 import logging
 import os
 import subprocess
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import websockets
@@ -57,15 +59,29 @@ class GymSessionResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _iso(v: Any) -> Any:
+    if isinstance(v, (date, datetime)):
+        return v.isoformat()
+    return v
+
+
+def _patient_marker_id(patient_id: str) -> int:
+    """Derive a stable ArUco marker ID from the patient ID (e.g. P001 → 0, P002 → 1)."""
+    import re
+    m = re.search(r'\d+', patient_id)
+    return (int(m.group()) - 1) if m else 0
+
+
 def _row_to_response(row, include_marker: bool) -> GymSessionResponse:
+    marker_id = _patient_marker_id(row["patient_id"])
     return GymSessionResponse(
         id=row["id"],
         patient_id=row["patient_id"],
         state=row["state"],
-        started_at=row["started_at"],
-        ended_at=row["ended_at"],
+        started_at=_iso(row["started_at"]),
+        ended_at=_iso(row["ended_at"]),
         last_event=row["last_event"],
-        marker_url=f"{CV_API_BASE}/live/marker.png" if include_marker else None,
+        marker_url=f"{CV_API_BASE}/live/marker.png?marker_id={marker_id}" if include_marker else None,
     )
 
 
@@ -73,7 +89,7 @@ def _active_session_for(patient_id: str) -> dict | None:
     """Return the most recent non-LEFT gym session for a patient, if any."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM gym_sessions WHERE patient_id = ? AND state != 'LEFT' "
+            "SELECT * FROM gym_sessions WHERE patient_id = %s AND state != 'LEFT' "
             "ORDER BY started_at DESC LIMIT 1",
             (patient_id,),
         ).fetchone()
@@ -84,14 +100,14 @@ def _set_state(session_id: int, state: str, last_event: str | None, ended: bool 
     with get_conn() as conn:
         if ended:
             conn.execute(
-                "UPDATE gym_sessions SET state = ?, last_event = ?, "
-                "ended_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
+                "UPDATE gym_sessions SET state = %s, last_event = %s, "
+                "ended_at = now(), updated_at = now() WHERE id = %s",
                 (state, last_event, session_id),
             )
         else:
             conn.execute(
-                "UPDATE gym_sessions SET state = ?, last_event = ?, "
-                "updated_at = datetime('now') WHERE id = ?",
+                "UPDATE gym_sessions SET state = %s, last_event = %s, "
+                "updated_at = now() WHERE id = %s",
                 (state, last_event, session_id),
             )
 
@@ -118,21 +134,22 @@ async def check_in(body: CheckInRequest):
     and its in-memory registry got wiped) and return the existing session
     instead of forcing the patient to /leave first.
     """
+    marker_id = _patient_marker_id(body.patient_id)
     existing = _active_session_for(body.patient_id)
     if existing is not None:
-        await _cv_post("/live/check_in", {"patient_id": body.patient_id})
+        await _cv_post("/live/check_in", {"patient_id": body.patient_id, "marker_id": marker_id})
         with get_conn() as conn:
-            row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (existing["id"],)).fetchone()
+            row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (existing["id"],)).fetchone()
         return _row_to_response(row, include_marker=row["state"] in ("CHECKING_IN", "LOST"))
 
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO gym_sessions(patient_id, state, last_event) VALUES (?, 'CHECKING_IN', 'check_in')",
+        row = conn.execute(
+            "INSERT INTO gym_sessions(patient_id, state, last_event) "
+            "VALUES (%s, 'CHECKING_IN', 'check_in') RETURNING *",
             (body.patient_id,),
-        )
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
+        ).fetchone()
 
-    await _cv_post("/live/check_in", {"patient_id": body.patient_id})
+    await _cv_post("/live/check_in", {"patient_id": body.patient_id, "marker_id": marker_id})
     return _row_to_response(row, include_marker=True)
 
 
@@ -141,7 +158,7 @@ async def still_here(session_id: int):
     """Patient tapped "I'm still here" after a lost prompt. Flip back to
     CHECKING_IN, re-arm CV's marker watch, and return the marker URL."""
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Gym session not found.")
     if row["state"] == "LEFT":
@@ -151,7 +168,7 @@ async def still_here(session_id: int):
     await _cv_post("/live/check_in", {"patient_id": row["patient_id"]})
 
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     return _row_to_response(row, include_marker=True)
 
 
@@ -159,7 +176,7 @@ async def still_here(session_id: int):
 async def leave(session_id: int):
     """Patient is leaving. Mark LEFT, tell CV to drop the binding."""
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Gym session not found.")
     if row["state"] == "LEFT":
@@ -170,14 +187,14 @@ async def leave(session_id: int):
     await _cv_post("/live/checkout", {"patient_id": row["patient_id"]})
 
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     return _row_to_response(row, include_marker=False)
 
 
 @router.get("/{session_id}", response_model=GymSessionResponse)
 def get_session(session_id: int):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Gym session not found.")
     show_marker = row["state"] in ("CHECKING_IN", "LOST")
@@ -308,11 +325,10 @@ async def generate_report(session_id: int):
     """
     import asyncio as _asyncio
     import json as _json
-    import sqlite3 as _sqlite3
     from datetime import datetime as _dt
 
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM gym_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = conn.execute("SELECT * FROM gym_sessions WHERE id = %s", (session_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -323,21 +339,18 @@ async def generate_report(session_id: int):
         _set_state(session_id, "LEFT", "report_generated", ended=True)
         await _cv_post("/live/checkout", {"patient_id": patient_id})
 
-    # Read session memories from claw DB
-    claw_db = "/home/ubuntu/ARES/claw/data/patients.db"
+    # Session memories now live in the same Postgres DB — no more cross-file hop.
     memories: list[dict] = []
     try:
-        claw_conn = _sqlite3.connect(claw_db)
-        claw_conn.row_factory = _sqlite3.Row
-        rows = claw_conn.execute(
-            "SELECT created_at, highlight FROM session_memories "
-            "WHERE patient_id = ? ORDER BY created_at ASC",
-            (patient_id,),
-        ).fetchall()
-        claw_conn.close()
-        memories = [{"created_at": r["created_at"], "highlight": r["highlight"]} for r in rows]
+        with get_conn() as conn:
+            mem_rows = conn.execute(
+                "SELECT created_at, highlight FROM session_memories "
+                "WHERE patient_id = %s ORDER BY created_at ASC",
+                (patient_id,),
+            ).fetchall()
+        memories = [{"created_at": r["created_at"], "highlight": r["highlight"]} for r in mem_rows]
     except Exception as exc:
-        log.warning("Could not read claw DB: %s", exc)
+        log.warning("Could not read session_memories: %s", exc)
 
     # Parse memories: format is "exercise | coaching note"
     exercises: list[str] = []

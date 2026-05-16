@@ -17,11 +17,16 @@ _CLAW_DIR = ROOT_DIR / "claw"
 if str(_CLAW_DIR) not in sys.path:
     sys.path.insert(0, str(_CLAW_DIR))
 
-# Single combined DB — clinical + app data in one place.
-# ARES_DB_PATH override lets tests redirect to a temp file before app import.
-DB_PATH = Path(
-    os.environ.get("ARES_DB_PATH", str(ROOT_DIR / "claw" / "data" / "patients.db"))
-)
+# Supabase Postgres connection URL — required.
+# Format: postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres
+# Use the *session* pooler (port 5432), not the transaction pooler.
+DB_URL = os.environ.get("ARES_DB_URL", "")
+if not DB_URL:
+    raise RuntimeError(
+        "ARES_DB_URL is not set. Copy backend/.env.example to backend/.env "
+        "and fill in your Supabase Postgres connection string. "
+        "See backend/SUPABASE_SETUP.md for details."
+    )
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SECRET_KEY       = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_please")

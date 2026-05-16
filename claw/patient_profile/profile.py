@@ -1,6 +1,6 @@
-"""Patient profile store backed by SQLite.
+"""Patient profile store backed by Supabase Postgres.
 
-Schema:
+Schema (created by backend/app/db/database.py:init_db):
   patients(id, name, date_of_birth, notes, doctor_note, risk_profile_json)
   exercises(id, name)                          -- catalog from the Kaggle
                                                   workout-fitness-video dataset
@@ -12,17 +12,24 @@ Schema:
   session_memories(id, patient_id, created_at, highlight)
                                                -- append-only log of past
                                                   session highlights
+
+Connection handling:
+  Prefers the backend's shared psycopg ConnectionPool when available (in-process
+  with FastAPI). Falls back to a standalone psycopg.connect() so this module is
+  still usable from scripts / pytest sessions that don't import `app.*`.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
+import os
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Iterator
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "patients.db"
+import psycopg
+from psycopg.rows import dict_row
 
 # Class names from
 # https://www.kaggle.com/datasets/hasyimabdillah/workoutfitness-video
@@ -110,72 +117,98 @@ class PatientProfile:
         return asdict(self)
 
 
-def _connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+@contextmanager
+def _connect() -> Iterator[psycopg.Connection]:
+    """Yield a Postgres connection.
+
+    Prefers the backend's shared pool when `app.db.database` is importable,
+    so the FastAPI process doesn't open extra socket connections. Falls back
+    to a standalone connect() for scripts and test sessions.
+    """
+    try:
+        from app.db.database import get_conn as _backend_get_conn  # type: ignore
+    except Exception:
+        _backend_get_conn = None  # type: ignore[assignment]
+
+    if _backend_get_conn is not None:
+        with _backend_get_conn() as conn:
+            yield conn
+        return
+
+    dsn = os.environ.get("ARES_DB_URL", "")
+    if not dsn:
+        raise RuntimeError(
+            "ARES_DB_URL is not set. Set it in your environment or .env file."
+        )
+    with psycopg.connect(dsn, row_factory=dict_row) as conn:
+        yield conn
 
 
-def init_db(db_path: Path = DB_PATH) -> None:
-    with _connect(db_path) as conn:
-        conn.executescript(
-            """
+def init_db() -> None:
+    """Ensure the clinical + app tables exist.
+
+    Delegates to backend.app.db.database.init_db when available (the canonical
+    DDL). Falls back to running just the clinical-side DDL when the backend
+    package isn't importable (e.g. running claw standalone).
+    """
+    try:
+        from app.db.database import init_db as _backend_init_db  # type: ignore
+        _backend_init_db()
+        return
+    except Exception:
+        pass
+
+    with _connect() as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS patients (
                 id            TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
                 date_of_birth TEXT,
                 notes         TEXT
             );
-
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS exercises (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                id   BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE
             );
-
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS patient_exercises (
                 patient_id  TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-                exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
+                exercise_id BIGINT NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
                 PRIMARY KEY (patient_id, exercise_id)
             );
-
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS session_memories (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id         BIGSERIAL PRIMARY KEY,
                 patient_id TEXT NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 highlight  TEXT NOT NULL
             );
-
+        """)
+        conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_patient
                 ON session_memories(patient_id, created_at);
-
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS patient_exercise_counts (
                 patient_id    TEXT    NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
                 exercise_name TEXT    NOT NULL,
                 session_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (patient_id, exercise_name)
             );
-
+        """)
+        conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_ex_counts_patient
                 ON patient_exercise_counts(patient_id, session_count DESC);
-            """
-        )
-
-        # ALTER TABLE is not idempotent inside executescript (the script aborts
-        # on first error). Run each one in its own try/except so re-running
-        # init_db on a populated DB is safe.
-        for stmt in (
-            "ALTER TABLE patients ADD COLUMN doctor_note TEXT",
-            "ALTER TABLE patients ADD COLUMN risk_profile_json TEXT",
-        ):
-            try:
-                conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass  # column already exists
+        """)
+        conn.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS doctor_note TEXT;")
+        conn.execute("ALTER TABLE patients ADD COLUMN IF NOT EXISTS risk_profile_json TEXT;")
 
 
-def _refresh_common_exercises(patient_id: str, conn: sqlite3.Connection) -> None:
+def _refresh_common_exercises(patient_id: str, conn: psycopg.Connection) -> None:
     """Recompute the top-3 common exercises and rewrite patient_exercises.
 
     Prefers rows with session_count>0 (real session data) over count=0 rows
@@ -183,105 +216,95 @@ def _refresh_common_exercises(patient_id: str, conn: sqlite3.Connection) -> None
     fills the remaining slots from count=0 entries so prefetch still has
     something to warm up.
     """
-    hot = conn.execute(
+    hot_rows = conn.execute(
         "SELECT exercise_name FROM patient_exercise_counts "
-        "WHERE patient_id = ? AND session_count > 0 "
+        "WHERE patient_id = %s AND session_count > 0 "
         "ORDER BY session_count DESC, exercise_name ASC LIMIT 3",
         (patient_id,),
     ).fetchall()
-    chosen = [r["exercise_name"] for r in hot]
+    chosen = [r["exercise_name"] for r in hot_rows]
 
     if len(chosen) < 3:
-        cold = conn.execute(
+        cold_rows = conn.execute(
             "SELECT exercise_name FROM patient_exercise_counts "
-            "WHERE patient_id = ? AND session_count = 0 "
+            "WHERE patient_id = %s AND session_count = 0 "
             "  AND exercise_name NOT IN (SELECT exercise_name FROM patient_exercise_counts "
-            "                            WHERE patient_id = ? AND session_count > 0) "
-            "ORDER BY exercise_name ASC LIMIT ?",
+            "                            WHERE patient_id = %s AND session_count > 0) "
+            "ORDER BY exercise_name ASC LIMIT %s",
             (patient_id, patient_id, 3 - len(chosen)),
         ).fetchall()
-        chosen.extend(r["exercise_name"] for r in cold)
+        chosen.extend(r["exercise_name"] for r in cold_rows)
 
-    conn.execute("DELETE FROM patient_exercises WHERE patient_id = ?", (patient_id,))
+    conn.execute("DELETE FROM patient_exercises WHERE patient_id = %s", (patient_id,))
     for ex_name in chosen:
         conn.execute(
-            "INSERT OR IGNORE INTO exercises(name) VALUES (?)",
+            "INSERT INTO exercises(name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
             (ex_name,),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO patient_exercises(patient_id, exercise_id) "
-            "SELECT ?, id FROM exercises WHERE name = ?",
+            "INSERT INTO patient_exercises(patient_id, exercise_id) "
+            "SELECT %s, id FROM exercises WHERE name = %s "
+            "ON CONFLICT DO NOTHING",
             (patient_id, ex_name),
         )
 
 
-def refresh_common_exercises(patient_id: str, db_path: Path = DB_PATH) -> None:
-    """Public wrapper that opens its own write-locked connection."""
-    with _connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+def refresh_common_exercises(patient_id: str) -> None:
+    """Public wrapper that opens its own connection."""
+    with _connect() as conn:
         _refresh_common_exercises(patient_id, conn)
 
 
-def increment_exercise_count(
-    patient_id: str, exercise_name: str, db_path: Path = DB_PATH
-) -> None:
-    """Increment the session count for an exercise and refresh top-3.
-
-    Wrapped in BEGIN IMMEDIATE so concurrent daemon ticks don't race on the
-    top-3 refresh (the daemon emits PATIENT_PAUSED on a fast cadence).
-    """
-    with _connect(db_path) as conn:
-        conn.execute("BEGIN IMMEDIATE")
+def increment_exercise_count(patient_id: str, exercise_name: str) -> None:
+    """Increment the session count for an exercise and refresh top-3."""
+    with _connect() as conn:
         conn.execute(
             "INSERT INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
-            "VALUES (?, ?, 1) "
+            "VALUES (%s, %s, 1) "
             "ON CONFLICT(patient_id, exercise_name) DO UPDATE "
-            "SET session_count = session_count + 1",
+            "SET session_count = patient_exercise_counts.session_count + 1",
             (patient_id, exercise_name),
         )
         _refresh_common_exercises(patient_id, conn)
 
 
-def seed_db(db_path: Path = DB_PATH, *, reset: bool = False) -> None:
-    init_db(db_path)
-    with _connect(db_path) as conn:
+def seed_db(*, reset: bool = False) -> None:
+    init_db()
+    with _connect() as conn:
         if reset:
-            conn.executescript(
-                "DELETE FROM patient_exercise_counts;"
-                "DELETE FROM patient_exercises;"
-                "DELETE FROM session_memories;"
-                "DELETE FROM patients;"
-                "DELETE FROM exercises;"
-            )
+            conn.execute("DELETE FROM patient_exercise_counts;")
+            conn.execute("DELETE FROM patient_exercises;")
+            conn.execute("DELETE FROM session_memories;")
+            conn.execute("DELETE FROM patients;")
+            conn.execute("DELETE FROM exercises;")
 
-        conn.executemany(
-            "INSERT OR IGNORE INTO exercises(name) VALUES (?)",
-            [(name,) for name in KAGGLE_EXERCISES],
-        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO exercises(name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                [(name,) for name in KAGGLE_EXERCISES],
+            )
 
         for p in DEMO_PATIENTS:
             conn.execute(
-                "INSERT OR IGNORE INTO patients(id, name, date_of_birth, notes) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO patients(id, name, date_of_birth, notes) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (p["id"], p["name"], p["date_of_birth"], p["notes"]),
             )
             counts = DEMO_EXERCISE_COUNTS.get(p["id"], {})
             for ex_name, count in counts.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (patient_id, exercise_name) DO NOTHING",
                     (p["id"], ex_name, count),
                 )
             _refresh_common_exercises(p["id"], conn)
 
 
-def get_patient_profile(
-    patient_id: str, db_path: Path = DB_PATH
-) -> PatientProfile | None:
-    with _connect(db_path) as conn:
+def get_patient_profile(patient_id: str) -> PatientProfile | None:
+    with _connect() as conn:
         row = conn.execute(
             "SELECT id, name, date_of_birth, notes, doctor_note, risk_profile_json "
-            "FROM patients WHERE id = ?",
+            "FROM patients WHERE id = %s",
             (patient_id,),
         ).fetchone()
         if row is None:
@@ -292,19 +315,19 @@ def get_patient_profile(
             for r in conn.execute(
                 "SELECT e.name FROM exercises e "
                 "JOIN patient_exercises pe ON pe.exercise_id = e.id "
-                "WHERE pe.patient_id = ? "
+                "WHERE pe.patient_id = %s "
                 "ORDER BY e.name",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
 
         memories = [
             SessionMemory(created_at=r["created_at"], highlight=r["highlight"])
             for r in conn.execute(
                 "SELECT created_at, highlight FROM session_memories "
-                "WHERE patient_id = ? ORDER BY created_at DESC",
+                "WHERE patient_id = %s ORDER BY created_at DESC",
                 (patient_id,),
-            )
+            ).fetchall()
         ]
 
     risk_profile: dict = {}
@@ -331,13 +354,12 @@ def get_patient_profile(
 def add_session_memory(
     patient_id: str,
     highlight: str,
-    db_path: Path = DB_PATH,
     created_at: str | None = None,
 ) -> None:
-    ts = created_at or datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    with _connect(db_path) as conn:
+    ts = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    with _connect() as conn:
         conn.execute(
             "INSERT INTO session_memories(patient_id, created_at, highlight) "
-            "VALUES (?, ?, ?)",
+            "VALUES (%s, %s, %s)",
             (patient_id, ts, highlight),
         )

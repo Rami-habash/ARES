@@ -1,7 +1,8 @@
 'use client'
 import { useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { saveToken } from '@/lib/api/auth'
+import { saveToken, savePatientId } from '@/lib/api/auth'
+import { getMyProfile } from '@/lib/api/patients'
 
 export default function AuthCallback() {
   const router = useRouter()
@@ -13,7 +14,22 @@ export default function AuthCallback() {
 
     if (token && role) {
       saveToken(token, role)
-      router.replace('/dashboard')
+      if (role === 'patient') {
+        // Resolve and persist the patient_id before redirecting
+        getMyProfile().then((profile) => {
+          if (profile) {
+            savePatientId(profile.id)
+            router.replace('/patient/check-in')
+          } else {
+            // Google account exists but isn't linked to a patient record yet
+            router.replace('/patient/sign-in?error=unlinked')
+          }
+        }).catch(() => {
+          router.replace('/patient/sign-in?error=unlinked')
+        })
+      } else {
+        router.replace('/dashboard')
+      }
     } else {
       router.replace('/')
     }

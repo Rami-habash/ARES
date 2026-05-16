@@ -34,15 +34,29 @@ export function getRole(): string | null {
   return localStorage.getItem('ares_role')
 }
 
+export function savePatientId(id: string): void {
+  if (typeof window === 'undefined') return
+  localStorage.setItem('ares_patient_id', id)
+}
+
+export function getPatientId(): string | null {
+  if (typeof window === 'undefined') return null
+  return localStorage.getItem('ares_patient_id')
+}
+
 export function clearToken(): void {
   if (typeof window === 'undefined') return
   localStorage.removeItem('ares_token')
   localStorage.removeItem('ares_role')
+  localStorage.removeItem('ares_patient_id')
 }
 
 export function authHeaders(): HeadersInit {
   const token = getToken()
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  return {
+    'ngrok-skip-browser-warning': 'true',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  }
 }
 
 // ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -57,7 +71,7 @@ export async function login(email: string, password: string): Promise<AuthRespon
   }
   const res = await fetch(`${API_BASE}/auth/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
     body: JSON.stringify({ email, password }),
   })
   if (!res.ok) {
@@ -82,7 +96,7 @@ export async function register(
   }
   const res = await fetch(`${API_BASE}/auth/register`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
     body: JSON.stringify({ email, password, name, role }),
   })
   if (!res.ok) {
@@ -102,7 +116,7 @@ export async function getMe(): Promise<UserMe> {
   if (USE_MOCK) {
     return { id: 0, email: 'demo@solstice.health', name: 'Demo User', role: 'admin', nemo_patient_id: null }
   }
-  const res = await fetch(`${API_BASE}/users/me`, { headers: authHeaders() })
+  const res = await fetch(`${API_BASE}/users/me`, { headers: { ...authHeaders() } })
   if (!res.ok) throw new Error('Not authenticated')
   return res.json()
 }

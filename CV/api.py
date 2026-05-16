@@ -283,6 +283,7 @@ async def webrtc_offer(payload: dict):
 
 class CheckInRequest(BaseModel):
     patient_id: str
+    marker_id: int = identity.CHECK_IN_MARKER_ID
 
 
 def _require_session() -> LiveSession:
@@ -300,8 +301,8 @@ async def live_check_in(payload: CheckInRequest):
     identity emits patient_checked_in on /live/events and the binding sticks.
     """
     session = _require_session()
-    session.identity.expect_check_in(payload.patient_id)
-    return {"status": "watching", "patient_id": payload.patient_id, "marker_id": identity.CHECK_IN_MARKER_ID}
+    session.identity.expect_check_in(payload.patient_id, payload.marker_id)
+    return {"status": "watching", "patient_id": payload.patient_id, "marker_id": payload.marker_id}
 
 
 @app.post("/live/checkout")
@@ -313,9 +314,9 @@ async def live_checkout(payload: CheckInRequest):
 
 
 @app.get("/live/marker.png")
-async def live_marker_png():
-    """Render the hardcoded check-in ArUco marker. Patient phone displays this fullscreen."""
-    png = identity.render_marker_png()
+async def live_marker_png(marker_id: int = identity.CHECK_IN_MARKER_ID):
+    """Render an ArUco marker PNG by ID. Patient phone displays this fullscreen."""
+    png = identity.render_marker_png(marker_id)
     return Response(content=png, media_type="image/png")
 
 
@@ -592,8 +593,8 @@ async def live_stop():
 
 
 @app.get("/live/mjpeg")
-async def live_mjpeg():
-    """MJPEG stream of the security camera feed. Consumable by cv2.VideoCapture."""
+async def live_mjpeg(stream: str = "security"):
+    """MJPEG stream of the named camera feed (security or detail)."""
     session = _live["session"]
     if session is None:
         raise HTTPException(status_code=503, detail="No live session running.")
@@ -601,14 +602,21 @@ async def live_mjpeg():
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=30)
 
+    # Security stream is proxied through ngrok — downscale to save bandwidth.
+    # Detail stream stays on localhost so we can keep full resolution.
+    max_width = 640 if stream == "security" else None
+
     def on_raw_frame(frame: np.ndarray) -> None:
-        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        h, w = frame.shape[:2]
+        if max_width and w > max_width:
+            frame = cv2.resize(frame, (max_width, int(h * max_width / w)), interpolation=cv2.INTER_LINEAR)
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50 if stream == "security" else 80])
         try:
             loop.call_soon_threadsafe(queue.put_nowait, buf.tobytes())
         except asyncio.QueueFull:
             pass
 
-    unsubscribe = session.subscribe_raw(on_raw_frame)
+    unsubscribe = session.subscribe_raw(on_raw_frame, stream=stream)
 
     async def generate():
         try:

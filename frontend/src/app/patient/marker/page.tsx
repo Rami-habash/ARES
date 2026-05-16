@@ -1,18 +1,20 @@
 'use client'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { useEffect, useState } from 'react'
-import { API_BASE, CV_BASE } from '@/lib/config'
-import { DEMO_PATIENT_ID } from '@/lib/patient'
+import { API_BASE } from '@/lib/config'
+import { authHeaders } from '@/lib/api/auth'
 import { useGymSession } from '@/hooks/useGymSession'
+import PatientGuard from '@/components/patient/PatientGuard'
+import PatientHeader from '@/components/patient/PatientHeader'
 
-const MARKER_URL = `${CV_BASE}/live/marker.png`
+// Static pre-generated marker PNGs in public/markers/ (no CV server needed at runtime)
+function markerUrl(patientId: string): string {
+  const m = patientId.match(/\d+/)
+  const id = m ? parseInt(m[0], 10) - 1 : 0
+  return `/markers/marker_${id}.png`
+}
 
-// Step 2: fullscreen marker. Polls /gym/{id} and:
-//   - CHECKING_IN → "Hold your phone up to the camera"
-//   - ACTIVE      → "Checked in ✓ — you can put your phone away"
-//   - LOST        → bounce to /patient/lost
-//   - LEFT        → bounce to /patient/check-in
-export default function PatientMarkerPage() {
+function MarkerContent({ patientId }: { patientId: string }) {
   const router = useRouter()
   const params = useSearchParams()
   const sessionId = Number(params.get('session_id'))
@@ -20,16 +22,14 @@ export default function PatientMarkerPage() {
   const { session, error } = useGymSession(validId)
   const [leaving, setLeaving] = useState(false)
 
-  // Re-arm CV's marker watch on mount. /gym/check_in is idempotent — if the
-  // session is already ACTIVE the state stays ACTIVE; if CV was restarted
-  // since check-in, this re-populates its in-memory registry.
+  // Re-arm CV's marker watch on mount. Idempotent — safe to call on every page load.
   useEffect(() => {
     fetch(`${API_BASE}/gym/check_in`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ patient_id: DEMO_PATIENT_ID }),
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ patient_id: patientId }),
     }).catch(() => {})
-  }, [])
+  }, [patientId])
 
   useEffect(() => {
     if (!session) return
@@ -41,59 +41,84 @@ export default function PatientMarkerPage() {
     if (!validId) return
     setLeaving(true)
     try {
-      await fetch(`${API_BASE}/gym/${validId}/leave`, { method: 'POST' })
+      await fetch(`${API_BASE}/gym/${validId}/leave`, { method: 'POST', headers: authHeaders() })
     } finally {
       router.replace('/patient/check-in')
     }
   }
 
+  const requestReport = () => {
+    router.push(`/patient/report?session_id=${validId}`)
+  }
+
   if (!validId) {
     return (
       <div className="flex flex-col flex-1 justify-center text-center gap-4">
-        <p className="text-red-400">Missing session_id.</p>
-        <button onClick={() => router.replace('/patient/check-in')} className="underline">
+        <p className="text-red-600">Missing session_id.</p>
+        <button onClick={() => router.replace('/patient/check-in')} className="underline text-[#1a1208]/60">
           Start over
         </button>
       </div>
     )
   }
 
+  const isActive = session?.state === 'ACTIVE'
   const banner =
     !session ? 'Loading…' :
-    session.state === 'ACTIVE'      ? 'Checked in ✓ — you can put your phone away' :
+    isActive ? 'Checked in — you can put your phone away' :
     session.state === 'CHECKING_IN' ? 'Hold this screen up to the gym camera' :
     'Loading…'
-  const bannerColor =
-    session?.state === 'ACTIVE' ? 'bg-green-500/20 text-green-300' :
-    'bg-blue-500/20 text-blue-200'
+  const bannerColor = isActive
+    ? 'bg-[#2d7a4f]/15 text-[#2d7a4f]'
+    : 'bg-[#c45c1a]/10 text-[#c45c1a]'
 
   return (
-    <div className="flex flex-col flex-1 gap-4">
-      <div className={`rounded-lg px-4 py-3 text-center text-sm font-medium ${bannerColor}`}>
-        {banner}
+    <div className="flex flex-col flex-1">
+      <PatientHeader />
+
+      <div className="flex flex-col flex-1 gap-4">
+        <div className={`rounded-lg px-4 py-3 text-center text-sm font-medium ${bannerColor}`}>
+          {banner}
+        </div>
+
+        <div className="flex-1 flex items-center justify-center bg-white rounded-2xl overflow-hidden shadow-sm">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={markerUrl(patientId)}
+            alt="check-in marker"
+            className="w-full h-full object-contain"
+          />
+        </div>
+
+        {isActive && (
+          <button
+            onClick={requestReport}
+            className="rounded-xl bg-[#e8622c] hover:bg-[#d4561f] text-white text-base font-semibold py-3.5 transition-colors"
+          >
+            Request my report
+          </button>
+        )}
+
+        <button
+          onClick={leave}
+          disabled={leaving}
+          className="rounded-xl border border-[#1a1208]/15 hover:bg-[#1a1208]/5 disabled:opacity-50 text-[#1a1208]/60 text-sm font-medium py-3 transition-colors"
+        >
+          {leaving ? 'Leaving…' : 'Leave gym'}
+        </button>
+
+        {error && (
+          <p className="text-sm text-red-600 break-words">{error}</p>
+        )}
       </div>
-
-      <div className="flex-1 flex items-center justify-center bg-white rounded-2xl overflow-hidden">
-        {/* The marker PNG comes from CV. eslint-disable: it's a runtime URL, not a static asset. */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={MARKER_URL}
-          alt="check-in marker"
-          className="w-full h-full object-contain"
-        />
-      </div>
-
-      <button
-        onClick={leave}
-        disabled={leaving}
-        className="rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white text-base font-medium py-3"
-      >
-        {leaving ? 'Leaving…' : 'Leave gym'}
-      </button>
-
-      {error && (
-        <p className="text-sm text-red-400 break-words">{error}</p>
-      )}
     </div>
+  )
+}
+
+export default function PatientMarkerPage() {
+  return (
+    <PatientGuard>
+      {(patientId) => <MarkerContent patientId={patientId} />}
+    </PatientGuard>
   )
 }

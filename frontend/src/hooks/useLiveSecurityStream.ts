@@ -52,7 +52,7 @@ export type BroadcastStatus =
 //  - videoRef to attach to a <video> element
 //  - the most recent LiveFrame for overlay rendering
 //  - source resolution so the overlay canvas can map bbox coords correctly
-export function useLiveSecurityStream(stream: string = 'security') {
+export function useLiveSecurityStream(stream: string = 'security', cvBase: string = CV_BASE) {
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -136,7 +136,7 @@ export function useLiveSecurityStream(stream: string = 'security') {
     try {
       // Make sure CV has a LiveSession ready before we offer it a track.
       // 409 means "session already running" which is fine — we just attach.
-      const startResp = await fetch(`${CV_BASE}/live/start_webrtc`, { method: 'POST' })
+      const startResp = await fetch(`${cvBase}/live/start_webrtc`, { method: 'POST' })
       if (!startResp.ok && startResp.status !== 409) {
         setStatus({ error: `start_webrtc failed: ${await startResp.text()}` })
         return
@@ -164,7 +164,7 @@ export function useLiveSecurityStream(stream: string = 'security') {
         })
       })
 
-      const resp = await fetch(`${CV_BASE}/webrtc/offer`, {
+      const resp = await fetch(`${cvBase}/webrtc/offer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stream, sdp: pc.localDescription!.sdp, type: pc.localDescription!.type }),

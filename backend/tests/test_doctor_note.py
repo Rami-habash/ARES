@@ -72,7 +72,7 @@ def test_doctor_note_seeds_counts_with_zero(test_app, admin_headers):
                 for r in conn.execute(
                     "SELECT exercise_name, session_count FROM patient_exercise_counts "
                     "WHERE patient_id = 'P001'"
-                )}
+                ).fetchall()}
     assert rows.get("bench press") == 0
     assert rows.get("pull up") == 0
     # Existing seed must not be clobbered

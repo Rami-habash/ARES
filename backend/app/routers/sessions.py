@@ -6,6 +6,7 @@ a room video.  Used by both the admin report view and the patient mobile view.
 from __future__ import annotations
 
 import json
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -26,7 +27,13 @@ class CreateSessionRequest(BaseModel):
 
 def _row_to_dict(row) -> dict:
     d = dict(row)
-    d["exercises"] = json.loads(d.pop("exercises_json", "[]"))
+    # exercises_json is TEXT containing a JSON array.
+    d["exercises"] = json.loads(d.pop("exercises_json", "[]") or "[]")
+    # session_date is a date, created_at is a datetime — both need string form for JSON.
+    if isinstance(d.get("session_date"), (date, datetime)):
+        d["session_date"] = d["session_date"].isoformat()
+    if isinstance(d.get("created_at"), (date, datetime)):
+        d["created_at"] = d["created_at"].isoformat()
     return d
 
 
@@ -40,7 +47,7 @@ def list_sessions(patient_id: str | None = None, user: dict = Depends(get_curren
         if user["role"] == "admin":
             if patient_id:
                 rows = conn.execute(
-                    "SELECT * FROM session_logs WHERE patient_id = ? ORDER BY session_date DESC",
+                    "SELECT * FROM session_logs WHERE patient_id = %s ORDER BY session_date DESC",
                     (patient_id,),
                 ).fetchall()
             else:
@@ -49,12 +56,12 @@ def list_sessions(patient_id: str | None = None, user: dict = Depends(get_curren
                 ).fetchall()
         else:
             link = conn.execute(
-                "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
+                "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
             ).fetchone()
             if link is None:
                 return {"sessions": []}
             rows = conn.execute(
-                "SELECT * FROM session_logs WHERE patient_id = ? ORDER BY session_date DESC",
+                "SELECT * FROM session_logs WHERE patient_id = %s ORDER BY session_date DESC",
                 (link["nemo_patient_id"],),
             ).fetchall()
 
@@ -64,9 +71,10 @@ def list_sessions(patient_id: str | None = None, user: dict = Depends(get_curren
 @router.post("", status_code=201)
 def create_session(body: CreateSessionRequest, user: dict = Depends(require_admin)):
     with get_conn() as conn:
-        cur = conn.execute(
+        row = conn.execute(
             "INSERT INTO session_logs(patient_id, session_date, exercises_json, form_score, summary) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (%s, %s, %s, %s, %s) "
+            "RETURNING *",
             (
                 body.patient_id,
                 body.session_date,
@@ -74,8 +82,7 @@ def create_session(body: CreateSessionRequest, user: dict = Depends(require_admi
                 body.form_score,
                 body.summary,
             ),
-        )
-        row = conn.execute("SELECT * FROM session_logs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        ).fetchone()
 
     return _row_to_dict(row)
 
@@ -84,7 +91,7 @@ def create_session(body: CreateSessionRequest, user: dict = Depends(require_admi
 def get_session(session_id: int, user: dict = Depends(get_current_user)):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM session_logs WHERE id = ?", (session_id,)
+            "SELECT * FROM session_logs WHERE id = %s", (session_id,)
         ).fetchone()
 
     if row is None:
@@ -95,7 +102,7 @@ def get_session(session_id: int, user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         with get_conn() as conn:
             link = conn.execute(
-                "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
+                "SELECT nemo_patient_id FROM patient_links WHERE user_id = %s", (user["id"],)
             ).fetchone()
         if link is None or link["nemo_patient_id"] != d["patient_id"]:
             raise HTTPException(status_code=403, detail="Access denied")

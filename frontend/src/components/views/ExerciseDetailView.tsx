@@ -103,9 +103,9 @@ function PatientCard({ session, onClick }: { session: GymSession; onClick: () =>
 
 function PatientCoachingView({ session, onBack }: { session: GymSession; onBack: () => void }) {
   const tag = stateLabel[session.state]
-  const { mediaStream, latestFrame, sourceSize, status } = useLiveStream()
+  const { detail } = useLiveStream()
   const { profile, error: profileError } = usePatientProfile(session.patient_id)
-  const broadcasting = status === 'broadcasting'
+  const broadcasting = detail.status === 'broadcasting'
 
   const [report, setReport]     = useState<string | null>(null)
   const [busy, setBusy]         = useState<'leave' | 'still_here' | 'report' | null>(null)
@@ -201,19 +201,27 @@ function PatientCoachingView({ session, onBack }: { session: GymSession; onBack:
       <div className="flex gap-4 flex-1 min-h-0">
         <div className="flex-1 min-w-0 relative">
           <LiveCameraCanvas
-            mediaStream={mediaStream}
-            latestFrame={latestFrame}
-            sourceSize={sourceSize}
+            latestFrame={detail.latestFrame}
+            sourceSize={detail.sourceSize}
             selectedPatientId={session.patient_id}
             filterPatientId={session.patient_id}
             showKeypoints
+            mjpegSrc={`${process.env.NEXT_PUBLIC_CV_LOCAL ?? 'http://localhost:8001'}/live/mjpeg?stream=detail`}
           />
           {!broadcasting && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/60 rounded-lg pointer-events-none">
-              <p className="text-white/80 text-sm text-center px-6">
-                Camera broadcast is not running.<br />
-                Start it from the <span className="font-semibold">Room Monitor</span> tab.
-              </p>
+            <div className="absolute inset-0 flex items-center justify-center bg-black/60 rounded-lg">
+              <div className="text-center px-6">
+                <p className="text-white/80 text-sm mb-3">
+                  Share this laptop&apos;s webcam for high-fidelity pose analysis.
+                </p>
+                <button
+                  onClick={detail.start}
+                  className="rounded-md bg-accent-blue hover:opacity-90 text-white text-sm font-medium px-4 py-2"
+                >
+                  {detail.status === 'requesting-camera' ? 'Requesting camera…' :
+                   detail.status === 'connecting' ? 'Connecting…' : 'Start detail camera'}
+                </button>
+              </div>
             </div>
           )}
         </div>
