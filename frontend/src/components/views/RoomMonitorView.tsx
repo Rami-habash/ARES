@@ -5,11 +5,8 @@ import LiveCameraCanvas from '@/components/room-monitor/LiveCameraCanvas'
 import LiveInspector from '@/components/room-monitor/LiveInspector'
 import { useLiveSecurityStream } from '@/hooks/useLiveSecurityStream'
 import { useGymSessions } from '@/hooks/useGymSessions'
+import { useCoachingFeed } from '@/hooks/useCoachingFeed'
 
-// Real live security stream: webcam is captured here, pushed to CV via WebRTC,
-// and CV's per-frame detections come back over /live/ws to overlay bboxes +
-// patient_id labels. Backend's /gym sessions populate the side inspector so
-// you can see the check-in / lost / active lifecycle alongside the feed.
 export default function RoomMonitorView() {
   const {
     videoRef,
@@ -21,6 +18,7 @@ export default function RoomMonitorView() {
     handleVideoMetadata,
   } = useLiveSecurityStream('security')
   const { sessions, error: sessionsError } = useGymSessions()
+  const { messages: coachingMessages } = useCoachingFeed()
   const [selectedPatientId, setSelectedPatientId] = useState<string | null>(null)
 
   return (
@@ -55,6 +53,7 @@ export default function RoomMonitorView() {
             sessionsError={sessionsError}
             selectedPatientId={selectedPatientId}
             onSelectPatient={setSelectedPatientId}
+            coachingMessages={coachingMessages}
           />
         </div>
       </div>

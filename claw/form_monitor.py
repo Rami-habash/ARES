@@ -110,18 +110,35 @@ class MotionDetector:
 
 
 # ---------------------------------------------------------------------------
-# Form comparator — STUB
+# Form comparator
 # ---------------------------------------------------------------------------
 
-def compare_to_reference(clip_path: str, exercise_name: str) -> object | None:
-    """Compare patient clip to reference videos for *exercise_name*.
+import form_analysis  # noqa: E402 — CV dir already on sys.path above
 
-    TODO: implementation is owned by another teammate. Return value can be
-    any structure the comparator produces — keypoints, joint deviations,
-    multi-frame trajectories, etc. Returning None keeps the daemon operational
-    while the real implementation lands.
-    """
-    return None
+_VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
+_ref_kp_cache: dict[str, list[list[dict]]] = {}   # exercise_name → landmarks
+
+
+def _reference_keypoints(pose_model, exercise_name: str) -> list[list[dict]] | None:
+    """Extract (and cache) keypoints from the first reference video for an exercise."""
+    if exercise_name in _ref_kp_cache:
+        return _ref_kp_cache[exercise_name]
+
+    ref_dir = _VIDEO_ROOT / exercise_name
+    if not ref_dir.is_dir():
+        return None
+    ref_videos = sorted(
+        v for v in ref_dir.iterdir()
+        if v.suffix.lower() in {".mp4", ".mov"}
+    )
+    if not ref_videos:
+        return None
+
+    lms = form_analysis.extract_reference_keypoints(
+        pose_model, str(ref_videos[0]), bbox_model=None, num_frames=64
+    )
+    _ref_kp_cache[exercise_name] = lms
+    return lms
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +175,21 @@ class FormMonitor:
         self.current_exercise: str | None = None
         self._motion    = MotionDetector()
         self._last_comparison_notify: float = 0.0
+
+    def _compare_to_reference(self, clip_path: str, exercise_name: str) -> object | None:
+        pose_model = self._motion._model_lazy()
+
+        ref_lms = _reference_keypoints(pose_model, exercise_name)
+        if ref_lms is None:
+            return None
+
+        pat_lms = form_analysis.extract_reference_keypoints(
+            pose_model, clip_path, bbox_model=None, num_frames=32
+        )
+
+        ref_angles = form_analysis.compute_joint_angles(ref_lms)
+        pat_angles = form_analysis.compute_joint_angles(pat_lms)
+        return form_analysis.compare_sequences(pat_angles, ref_angles)
 
     def tick(self, clip_path: str) -> TickResult:
         moving = self._motion.is_moving(clip_path)
@@ -207,7 +239,7 @@ class FormMonitor:
 
         # ── MONITORING ───────────────────────────────────────────────────────
         try:
-            data = compare_to_reference(clip_path, self.current_exercise)
+            data = self._compare_to_reference(clip_path, self.current_exercise)
         except Exception as e:
             logger.exception("compare_to_reference failed")
             return TickResult(self.state, self.current_exercise, None, None,
@@ -215,7 +247,7 @@ class FormMonitor:
 
         if data is None:
             return TickResult(self.state, self.current_exercise, None, None,
-                              f"{self.current_exercise} (comparator not yet implemented)")
+                              f"{self.current_exercise} (no reference video found)")
 
         now = time.monotonic()
         due = now - self._last_comparison_notify >= COMPARISON_INTERVAL_SECS

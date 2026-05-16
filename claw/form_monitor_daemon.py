@@ -230,6 +230,7 @@ async def broadcast_coaching(patient_id: str, text: str) -> None:
 
 OPENCLAW_SANDBOX  = "nemo-ares"
 OPENCLAW_SESSION  = "+10000000001"   # fixed number → stable session key
+BACKEND_BASE      = "http://localhost:8000"
 
 def _build_event_message(patient_id: str, result: TickResult) -> str:
     if result.event == Event.EXERCISE_IDENTIFIED:
@@ -238,9 +239,12 @@ def _build_event_message(patient_id: str, result: TickResult) -> str:
         was = result.exercise or "unknown"
         return f"[form_monitor] patient_paused | patient={patient_id} | was={was}"
     if result.event == Event.FORM_COMPARISON:
+        comparison = result.comparison or {}
+        context = comparison.get("agent_context", comparison.get("summary", str(comparison)))
+        context_inline = context.replace("\n", " ").replace("\r", "")
         return (
             f"[form_monitor] form_comparison | patient={patient_id} | exercise={result.exercise} | "
-            f"data={result.comparison}"
+            f"score={comparison.get('overall_score', '?')} | context={context_inline}"
         )
     return f"[form_monitor] unknown_event | patient={patient_id}"
 
@@ -284,6 +288,79 @@ async def default_agent_callback(patient_id: str, result: TickResult):
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+
+async def _fire_session_ended(patient_id: str) -> None:
+    """Read session memories and send session_ended event to the agent."""
+    import json as _json
+    import urllib.request as _urllib_req
+    from patient_profile.profile import get_patient_profile
+
+    profile = await asyncio.to_thread(get_patient_profile, patient_id)
+    if profile and profile.memories:
+        memory_lines = " || ".join(
+            f"{m.created_at}: {m.highlight}" for m in profile.memories[-15:]
+        )
+    else:
+        memory_lines = "none"
+
+    msg = f"[form_monitor] session_ended | patient={patient_id} | memories={memory_lines}"
+    print(f"  -> AGENT (session_ended): {msg!r}")
+
+    cmd = [
+        "openshell", "-g", "nemoclaw",
+        "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",
+        "openclaw", "agent",
+        "--to", OPENCLAW_SESSION,
+        "--message", msg,
+        "--json",
+    ]
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            try:
+                data = _json.loads(proc.stdout)
+                reply = data.get("result", {}).get("payloads", [{}])[0].get("text", "")
+                print(f"  <- AGENT: {reply}")
+                await broadcast_coaching(patient_id, reply)
+            except Exception:
+                print(f"  <- AGENT (raw): {proc.stdout[:200]}")
+        else:
+            logger.warning("session_ended agent call exited %d: %s", proc.returncode, proc.stderr[:200])
+    except Exception:
+        logger.exception("_fire_session_ended failed")
+
+
+async def poll_session_state(
+    patient_id: str,
+    stop_event: asyncio.Event,
+    poll_interval: float = 3.0,
+) -> None:
+    """Poll backend /gym every few seconds. When the patient disappears from
+    the non-LEFT list (meaning they tapped Leave), fire session_ended."""
+    import json as _json
+    import urllib.request as _urllib_req
+
+    seen_active = False
+    logger.info("Session polling started for %s (every %.0fs)", patient_id, poll_interval)
+    while not stop_event.is_set():
+        try:
+            with _urllib_req.urlopen(f"{BACKEND_BASE}/gym", timeout=5) as resp:
+                sessions = _json.loads(resp.read())
+            patient_active = any(s["patient_id"] == patient_id for s in sessions)
+            if patient_active:
+                seen_active = True
+            elif seen_active:
+                logger.info("Patient %s left gym - firing session_ended", patient_id)
+                await _fire_session_ended(patient_id)
+                stop_event.set()
+                return
+        except Exception as exc:
+            logger.debug("poll_session_state: %s", exc)
+        await asyncio.sleep(poll_interval)
+
 def _clear_agent_session():
     """Delete accumulated session history so each daemon run starts fresh."""
     cmd = [
@@ -313,6 +390,7 @@ async def run(patient_id: str, source: int | str, agent_callback=default_agent_c
         await asyncio.gather(
             capture_loop(source, clip_queue, stop_event),
             process_loop(monitor, clip_queue, agent_callback, stop_event),
+            poll_session_state(patient_id, stop_event),
         )
 
 

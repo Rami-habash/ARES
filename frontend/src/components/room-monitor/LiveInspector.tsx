@@ -1,16 +1,19 @@
 'use client'
 import type { GymSession } from '@/hooks/useGymSessions'
 import type { BroadcastStatus } from '@/hooks/useLiveSecurityStream'
+import type { CoachingMessage } from '@/hooks/useCoachingFeed'
 
 interface Props {
   broadcastStatus: BroadcastStatus
   onStartBroadcast: () => void
   onStopBroadcast:  () => void
 
-  sessions:         GymSession[]
-  sessionsError:    string | null
+  sessions:          GymSession[]
+  sessionsError:     string | null
   selectedPatientId: string | null
-  onSelectPatient:  (id: string | null) => void
+  onSelectPatient:   (id: string | null) => void
+
+  coachingMessages:  CoachingMessage[]
 }
 
 const stateLabel: Record<GymSession['state'], { text: string; classes: string }> = {
@@ -47,6 +50,7 @@ function BroadcastButton({ status, onStart, onStop }: { status: BroadcastStatus;
 export default function LiveInspector({
   broadcastStatus, onStartBroadcast, onStopBroadcast,
   sessions, sessionsError, selectedPatientId, onSelectPatient,
+  coachingMessages,
 }: Props) {
   const errorMsg = typeof broadcastStatus === 'object' ? broadcastStatus.error : null
 
@@ -106,6 +110,24 @@ export default function LiveInspector({
             </button>
           )
         })}
+      </div>
+
+      <div className="border-t border-border">
+        <div className="px-4 py-3 border-b border-border">
+          <p className="text-xs font-semibold uppercase tracking-widest text-text-muted">Coaching</p>
+        </div>
+        <div className="max-h-48 overflow-auto px-4 py-2 space-y-2">
+          {coachingMessages.length === 0 && (
+            <p className="text-xs text-text-muted">No coaching yet.</p>
+          )}
+          {coachingMessages.map((m, i) => (
+            <div key={i} className="text-xs">
+              <span className="text-text-muted font-mono mr-2">{m.ts}</span>
+              <span className="font-mono text-[10px] text-slate-400 mr-2">{m.patient_id}</span>
+              <span className="text-text-primary">{m.text}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )
