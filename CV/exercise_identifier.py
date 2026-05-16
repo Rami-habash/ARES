@@ -144,16 +144,56 @@ def _detect_insufficient_visibility(fingerprint: np.ndarray) -> bool:
     # If less than 2 visible joints, insufficient visibility
     return visible_count < 4
 
-def _score_exercises_pose(query_fingerprint: np.ndarray, 
-                         reference_fingerprints: Dict[str, np.ndarray],
-                         exercise_requirements: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+def _analyze_movement_patterns(query_fingerprint: np.ndarray, 
+                              reference_fingerprint: np.ndarray) -> float:
     """
-    Score exercises based on pose fingerprint similarity with visibility consideration.
+    Analyze movement patterns to determine compatibility between query and reference.
+    
+    This function compares the pattern of joint movement between query and reference,
+    giving higher scores to compatible movement patterns, lower scores to incompatible ones.
+    
+    Args:
+        query_fingerprint: 10-dim pose fingerprint from query video
+        reference_fingerprint: 10-dim pose fingerprint from reference video
+        
+    Returns:
+        Compatibility score (0.0-1.0)
+    """
+    # If insufficient visibility, return low score
+    if _detect_insufficient_visibility(query_fingerprint):
+        return 0.0
+        
+    # Check if both have the same "movement pattern" 
+    # For example, if both require significant lower body movement
+    query_knee_range = query_fingerprint[0] if not np.isnan(query_fingerprint[0]) else 0
+    query_hip_range = query_fingerprint[1] if not np.isnan(query_fingerprint[1]) else 0
+    query_ankle_range = query_fingerprint[8] if not np.isnan(query_fingerprint[8]) else 0
+    
+    ref_knee_range = reference_fingerprint[0] if not np.isnan(reference_fingerprint[0]) else 0
+    ref_hip_range = reference_fingerprint[1] if not np.isnan(reference_fingerprint[1]) else 0
+    ref_ankle_range = reference_fingerprint[8] if not np.isnan(reference_fingerprint[8]) else 0
+    
+    # If query has significant lower body movement but reference doesn't, 
+    # or vice versa, this is likely an incompatible match
+    query_lower_body_active = (query_knee_range > 20 or query_hip_range > 20 or query_ankle_range > 10)
+    ref_lower_body_active = (ref_knee_range > 20 or ref_hip_range > 20 or ref_ankle_range > 10)
+    
+    # If movement patterns are fundamentally incompatible, penalize heavily
+    if query_lower_body_active != ref_lower_body_active:
+        # Return a low score to indicate incompatibility
+        return 0.1
+        
+    # Otherwise, proceed with regular similarity calculation
+    return _cosine_similarity_masked(query_fingerprint, reference_fingerprint)
+
+def _score_exercises_pose(query_fingerprint: np.ndarray, 
+                         reference_fingerprints: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """
+    Score exercises based on pose fingerprint similarity with pattern compatibility checking.
     
     Args:
         query_fingerprint: 10-dim fingerprint vector from query video
         reference_fingerprints: Dict mapping exercise names to their reference fingerprint vectors
-        exercise_requirements: Dict mapping exercise names to their requirements
         
     Returns:
         Dictionary mapping exercise names to similarity scores
@@ -167,26 +207,9 @@ def _score_exercises_pose(query_fingerprint: np.ndarray,
     
     for exercise_name, ref_fingerprint in reference_fingerprints.items():
         if ref_fingerprint is not None and not np.all(np.isnan(ref_fingerprint)):
-            # Get exercise requirements to determine if this is a lower-body exercise
-            reqs = exercise_requirements.get(exercise_name, {})
-            is_lower_body = reqs.get('requires_lower_body', True)  # Default to true
-            
-            # For lower-body exercises, check if query has sufficient body visibility
-            if is_lower_body:
-                # If query doesn't have knee/hip data, it's likely not a valid lower-body exercise
-                knee_range_valid = not np.isnan(query_fingerprint[0])
-                hip_range_valid = not np.isnan(query_fingerprint[1])
-                
-                # If this is a lower-body exercise but query lacks lower-body data, score low
-                if not knee_range_valid and not hip_range_valid:
-                    scores[exercise_name] = 0.0
-                else:
-                    similarity = _cosine_similarity_masked(query_fingerprint, ref_fingerprint)
-                    scores[exercise_name] = similarity
-            else:
-                # For upper-body exercises, any visibility suffices
-                similarity = _cosine_similarity_masked(query_fingerprint, ref_fingerprint)
-                scores[exercise_name] = similarity
+            # Use pattern compatibility analysis instead of simple cosine similarity
+            similarity = _analyze_movement_patterns(query_fingerprint, ref_fingerprint)
+            scores[exercise_name] = similarity
         else:
             scores[exercise_name] = 0.0
             
@@ -196,8 +219,7 @@ def score_exercises_pose_fingerprint(exercise_videos: Dict[str, str],
                                     pose_model: Any,
                                     bbox_model: Any,
                                     patient_landmarks: List[Dict],
-                                    reference_cache_dir: str = "./reference_cache",
-                                    exercise_requirements: Dict[str, Dict[str, Any]] = None) -> Dict[str, float]:
+                                    reference_cache_dir: str = "./reference_cache") -> Dict[str, float]:
     """
     Main function to score exercises based on pose fingerprint similarity.
     
@@ -207,20 +229,10 @@ def score_exercises_pose_fingerprint(exercise_videos: Dict[str, str],
         bbox_model: Bounding box detection model  
         patient_landmarks: List of landmark dictionaries from patient video
         reference_cache_dir: Directory to cache reference fingerprints
-        exercise_requirements: Dict mapping exercise names to their requirements
         
     Returns:
         Dictionary mapping exercise names to similarity scores
     """
-    # Set default exercise requirements if none provided
-    if exercise_requirements is None:
-        exercise_requirements = {
-            'squat': {'requires_lower_body': True},
-            'leg_extension': {'requires_lower_body': True},
-            'push_up': {'requires_lower_body': False},
-            'arm_circles': {'requires_lower_body': False}
-        }
-    
     # Compute query fingerprint
     query_fingerprint = _compute_pose_fingerprint(patient_landmarks)
     
@@ -252,11 +264,7 @@ def score_exercises_pose_fingerprint(exercise_videos: Dict[str, str],
         pass  # Continue even if caching fails
         
     # Score exercises using pose similarity
-    pose_scores = _score_exercises_pose(
-        query_fingerprint, 
-        reference_fingerprints, 
-        exercise_requirements
-    )
+    pose_scores = _score_exercises_pose(query_fingerprint, reference_fingerprints)
     
     return pose_scores
 
@@ -267,8 +275,7 @@ def score_exercises_combined(exercise_videos: Dict[str, str],
                            s3d_scores: Dict[str, float],
                            reference_cache_dir: str = "./reference_cache",
                            pose_weight: float = 0.7,
-                           s3d_weight: float = 0.3,
-                           exercise_requirements: Dict[str, Dict[str, Any]] = None) -> Dict[str, float]:
+                           s3d_weight: float = 0.3) -> Dict[str, float]:
     """
     Combine pose similarity with S3D scores for improved exercise identification.
     
@@ -281,14 +288,13 @@ def score_exercises_combined(exercise_videos: Dict[str, str],
         reference_cache_dir: Directory to cache reference fingerprints
         pose_weight: Weight for pose-based scores (0.0-1.0)
         s3d_weight: Weight for S3D scores (0.0-1.0)
-        exercise_requirements: Dict mapping exercise names to their requirements
         
     Returns:
         Dictionary mapping exercise names to combined scores
     """
     # Get pose scores
     pose_scores = score_exercises_pose_fingerprint(
-        exercise_videos, pose_model, bbox_model, patient_landmarks, reference_cache_dir, exercise_requirements
+        exercise_videos, pose_model, bbox_model, patient_landmarks, reference_cache_dir
     )
     
     # Combine scores
