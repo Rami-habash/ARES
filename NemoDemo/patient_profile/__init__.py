@@ -1,5 +1,6 @@
 from .profile import (
     DB_PATH,
+    KAGGLE_EXERCISES,
     PatientProfile,
     SessionMemory,
     add_session_memory,
@@ -10,6 +11,7 @@ from .profile import (
 
 __all__ = [
     "DB_PATH",
+    "KAGGLE_EXERCISES",
     "PatientProfile",
     "SessionMemory",
     "add_session_memory",

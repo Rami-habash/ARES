@@ -6,3 +6,4 @@ NemoDemo/data/*.db
 *.pt
 *.npy
 *.json
+NemoDemo/data/videos/
