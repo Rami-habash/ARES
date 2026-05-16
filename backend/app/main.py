@@ -50,6 +50,18 @@ async def lifespan(app: FastAPI):
     if count == 0:
         seed()
 
+    # Re-attach form-monitor daemons for any session that was ACTIVE before we
+    # restarted. Without this, an admin who restarts the backend mid-session
+    # loses the coaching pipeline until the patient leaves+returns and CV
+    # fires another patient_found event.
+    from app.db.database import get_conn as _get_conn
+    with _get_conn() as _c:
+        _active = _c.execute(
+            "SELECT patient_id FROM gym_sessions WHERE state = 'ACTIVE'"
+        ).fetchall()
+    for _row in _active:
+        gym._start_daemon(_row["patient_id"])
+
     # Background task: mirror CV's identity lifecycle events into gym_sessions.
     stop = asyncio.Event()
     task = asyncio.create_task(gym.cv_event_subscriber(stop))

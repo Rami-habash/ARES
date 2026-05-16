@@ -66,8 +66,11 @@ def main():
     elapsed = time.time() - t0
 
     print(f"\n{'─'*50}")
-    print(f"Result  : {result or 'None (identification failed)'}")
-    print(f"Time    : {elapsed:.1f}s")
+    matched = result.exercise or 'None (identification failed)'
+    print(f"Matched   : {matched}")
+    if result.best_guess and result.best_score is not None:
+        print(f"Best guess: {result.best_guess} ({result.best_score:.4f})")
+    print(f"Time      : {elapsed:.1f}s")
     print(f"{'─'*50}\n")
 
 

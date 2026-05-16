@@ -27,10 +27,8 @@ triggers the OOD path when a patient does something outside their prescription.
 
 Embedding cache
 ---------------
-Reference embeddings are served from a RAM-resident LFU cache backed by
-.pt files under data/embeddings/.  On patient check-in call
-embedding_cache.prefetch_for_patient() to pre-warm the RAM cache so the
-first identification hit never touches disk.
+Reference embeddings are cached as .pt files under data/embeddings/ so
+subsequent runs are near-instant for already-seen videos.
 """
 
 from __future__ import annotations
@@ -39,12 +37,13 @@ import logging
 import os
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 
-from openai import OpenAI
+import subprocess
 
 _CV_DIR = Path(__file__).resolve().parent.parent / "CV"
 if str(_CV_DIR) not in sys.path:
@@ -53,7 +52,6 @@ if str(_CV_DIR) not in sys.path:
 import video_embeder  # noqa: E402
 
 from patient_profile import KAGGLE_EXERCISES, get_patient_profile  # noqa: E402
-import embedding_cache  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +62,10 @@ logger = logging.getLogger(__name__)
 THRESHOLD         = 0.75
 REFS_PER_EXERCISE = 5
 VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
+EMBED_CACHE_ROOT  = Path(__file__).resolve().parent / "data" / "embeddings"
 
-NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NEMOTRON_MODEL  = "nvidia/nemotron-3-nano-30b-a3b"
+OPENCLAW_SANDBOX    = "nemo-ares"
+OPENCLAW_OOD_SESSION = "+10000000002"  # separate key from coaching so OOD queries don't bleed into coaching context
 
 # ---------------------------------------------------------------------------
 # S3D model singleton
@@ -83,12 +81,26 @@ def _s3d():
 
 
 # ---------------------------------------------------------------------------
-# Embedding helpers (RAM LFU → disk → S3D)
+# Embedding helpers (with disk cache)
 # ---------------------------------------------------------------------------
 
+def _cache_path(video_path: Path) -> Path:
+    try:
+        rel = video_path.relative_to(VIDEO_ROOT)
+    except ValueError:
+        rel = Path(video_path.name)
+    return EMBED_CACHE_ROOT / rel.parent / (rel.stem + ".pt")
+
+
 def _embed(video_path: Path) -> np.ndarray:
-    """Return S3D embedding via the RAM LFU cache (see embedding_cache.py)."""
-    return embedding_cache.get_embedding(video_path, _s3d())
+    """S3D embed a video, reading from disk cache if available."""
+    cache = _cache_path(video_path)
+    if cache.exists():
+        return torch.load(cache, weights_only=True).numpy()
+    emb = video_embeder.embed(_s3d(), str(video_path))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.from_numpy(emb), cache)
+    return emb
 
 
 def _exercise_has_videos(exercise_name: str) -> bool:
@@ -175,23 +187,33 @@ def _build_ood_prompt(
 def _ask_nemotron(prompt: str) -> list[str]:
     import json, re
 
-    client = OpenAI(api_key=NVIDIA_API_KEY, base_url=NVIDIA_BASE_URL)
-    logger.debug("Calling Nemotron 3 Nano for OOD candidate selection...")
+    logger.debug("Calling nemo-ares via openclaw for OOD candidate selection...")
+    cmd = [
+        "openshell", "-g", "nemoclaw",
+        "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",
+        "openclaw", "agent",
+        "--to", OPENCLAW_OOD_SESSION,
+        "--message", prompt,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as exc:
+        logger.warning("openclaw OOD call failed: %s", exc)
+        return []
 
-    response = client.chat.completions.create(
-        model=NEMOTRON_MODEL,
-        # System message disables Nemotron's reasoning mode so the model
-        # commits to a direct answer instead of spinning in circles.
-        messages=[
-            {"role": "system", "content": "detailed thinking off"},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=1024,
-    )
-    msg = response.choices[0].message
-    raw = msg.content or getattr(msg, "reasoning_content", None) or ""
-    logger.info("Nemotron raw reply: %s", raw)
+    if proc.returncode != 0:
+        logger.warning("openclaw OOD exited %d: %s", proc.returncode, proc.stderr[:200])
+        return []
+
+    try:
+        data = json.loads(proc.stdout)
+        raw = data.get("result", {}).get("payloads", [{}])[0].get("text", "")
+    except Exception:
+        logger.warning("Could not parse openclaw OOD response: %s", proc.stdout[:200])
+        return []
+
+    logger.info("Nemotron OOD reply: %s", raw)
 
     # Find all bracketed candidates; try them from longest to shortest so we
     # prefer the full answer array over any incidental list-like fragments.
@@ -203,7 +225,7 @@ def _ask_nemotron(prompt: str) -> list[str]:
             continue
         if isinstance(candidates, list):
             return [c for c in candidates if isinstance(c, str)]
-    logger.warning("Nemotron reply contained no parseable JSON array.")
+    logger.warning("Nemotron OOD reply contained no parseable JSON array.")
     return []
 
 
@@ -213,25 +235,30 @@ def _ask_nemotron(prompt: str) -> list[str]:
 
 @dataclass
 class IdentifyResult:
-    """Outcome of one identification pass.
+    """Outcome of one identify_exercise() call.
 
-    `exercise` is set only when `best_score >= THRESHOLD`. `best_guess` and
-    `best_score` are always populated when at least one candidate was scored,
-    so the UI can surface the leading candidate even if it didn't clear the
-    bar.
+    `exercise` is the confirmed match (only set when best_score >= THRESHOLD).
+    `best_guess`/`best_score` always hold the leading candidate so the UI can
+    render a live "best guess" even before the threshold is cleared.
     """
     exercise:   str | None
-    best_guess: str | None = None
-    best_score: float | None = None
-    all_scores: dict[str, float] = field(default_factory=dict)
+    best_guess: str | None
+    best_score: float | None
+
+
+def _top_score(scores: dict[str, float]) -> tuple[str | None, float | None]:
+    if not scores:
+        return None, None
+    name = max(scores, key=lambda k: scores[k])
+    return name, scores[name]
 
 
 def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
     """Identify the exercise being performed in *query_video_path*.
 
-    Returns an IdentifyResult. `exercise` is the matched name, or None when
-    nothing cleared the confidence threshold — but `best_guess` always
-    reflects the top-scoring candidate so the caller can surface it.
+    Always returns an IdentifyResult. `exercise` is None when no candidate
+    cleared THRESHOLD; `best_guess`/`best_score` still carry the top scorer
+    so callers can show partial-match feedback.
     """
     profile = get_patient_profile(patient_id)
     if profile is None:
@@ -253,14 +280,10 @@ def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
     all_scores = _score_exercises(query_emb, in_domain)
 
     if all_scores:
-        best_ex = max(all_scores, key=lambda k: all_scores[k])
-        best_score = all_scores[best_ex]
-        if best_score >= THRESHOLD:
+        best_ex, best_score = _top_score(all_scores)
+        if best_score is not None and best_score >= THRESHOLD:
             logger.info("[%s] In-domain match: %r (%.4f)", patient_id, best_ex, best_score)
-            return IdentifyResult(
-                exercise=best_ex, best_guess=best_ex, best_score=best_score,
-                all_scores=dict(all_scores),
-            )
+            return IdentifyResult(exercise=best_ex, best_guess=best_ex, best_score=best_score)
         logger.info(
             "[%s] No in-domain match (best=%s %.4f). Entering OOD loop.",
             patient_id, best_ex, best_score,
@@ -301,14 +324,10 @@ def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
         all_scores.update(round_scores)
 
         if round_scores:
-            best_ex = max(round_scores, key=lambda k: round_scores[k])
-            best_score = round_scores[best_ex]
-            if best_score >= THRESHOLD:
+            best_ex, best_score = _top_score(round_scores)
+            if best_score is not None and best_score >= THRESHOLD:
                 logger.info("[%s] OOD match: %r (%.4f)", patient_id, best_ex, best_score)
-                return IdentifyResult(
-                    exercise=best_ex, best_guess=best_ex, best_score=best_score,
-                    all_scores=dict(all_scores),
-                )
+                return IdentifyResult(exercise=best_ex, best_guess=best_ex, best_score=best_score)
             logger.info(
                 "[%s] Round %d best: %s=%.4f — continuing.",
                 patient_id, round_num, best_ex, best_score,
@@ -320,9 +339,5 @@ def identify_exercise(patient_id: str, query_video_path: str) -> IdentifyResult:
         patient_id,
         "\n".join(f"  {ex}: {score:.4f}" for ex, score in all_scores_sorted),
     )
-    top_guess  = all_scores_sorted[0][0] if all_scores_sorted else None
-    top_score  = all_scores_sorted[0][1] if all_scores_sorted else None
-    return IdentifyResult(
-        exercise=None, best_guess=top_guess, best_score=top_score,
-        all_scores=dict(all_scores),
-    )
+    overall_best, overall_score = _top_score(all_scores)
+    return IdentifyResult(exercise=None, best_guess=overall_best, best_score=overall_score)

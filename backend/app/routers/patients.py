@@ -340,15 +340,9 @@ def my_profile(user: dict = Depends(get_current_user)):
 
 
 @router.get("/{patient_id}")
-def get_patient(patient_id: str, user: dict = Depends(get_current_user)):
-    if user["role"] != "admin":
-        with get_conn() as conn:
-            link = conn.execute(
-                "SELECT nemo_patient_id FROM patient_links WHERE user_id = ?", (user["id"],)
-            ).fetchone()
-        if link is None or link["nemo_patient_id"] != patient_id:
-            raise HTTPException(status_code=403, detail="Access denied")
-
+def get_patient(patient_id: str):
+    # Demo: unauthenticated, matching the /gym lifecycle endpoints. See the
+    # auth TODO in gym.py — patient-token auth is the same project for both.
     profile = _patient_with_sessions(patient_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="Patient not found")
