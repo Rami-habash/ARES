@@ -1,0 +1,14 @@
+# BoT-SORT with appearance ReID embeddings, tuned for indoor multi-person tracking.
+# Loaded by ultralytics via `model.track(tracker="botsort.yaml")`.
+tracker_type: botsort
+track_high_thresh: 0.6   # raise: only confident detections start/maintain tracks
+track_low_thresh: 0.1
+new_track_thresh: 0.7    # raise: fewer transient tracks from background false positives
+track_buffer: 30         # frames to keep a lost track around for re-id (~1s @ 30fps)
+match_thresh: 0.8
+fuse_score: True
+gmc_method: sparseOptFlow
+with_reid: True          # enables CLIP-based appearance embedding (ultralytics >= 8.3)
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+model: auto              # ultralytics picks the bundled CLIP-ReID weights

@@ -24,7 +24,16 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 
 # ── CV API ────────────────────────────────────────────────────────────────────
+# CV_API_BASE is the URL the backend uses for HTTP calls (check_in, checkout,
+# marker.png). When CV is fronted by ngrok / Cloudflare so phones can reach it,
+# set this to the public URL so /gym/check_in returns a marker URL the phone
+# can open directly.
 CV_API_BASE = os.environ.get("CV_API_BASE", "http://localhost:8001")
+
+# CV_INTERNAL_BASE is what the backend uses for its long-lived WebSocket
+# subscriber to /live/events. Defaults to localhost since the backend and CV
+# usually share a host — no point routing through ngrok for an internal call.
+CV_INTERNAL_BASE = os.environ.get("CV_INTERNAL_BASE", "http://localhost:8001")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = os.environ.get(

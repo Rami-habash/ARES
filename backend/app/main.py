@@ -26,6 +26,7 @@ Environment variables (.env):
 """
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -34,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import ALLOWED_ORIGINS
 from app.db.database import init_db
 from app.db.seed import seed
-from app.routers import ai, alerts, auth, patients, sessions, users
+from app.routers import ai, alerts, auth, gym, patients, sessions, users
 
 
 @asynccontextmanager
@@ -46,7 +47,19 @@ async def lifespan(app: FastAPI):
         count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if count == 0:
         seed()
-    yield
+
+    # Background task: mirror CV's identity lifecycle events into gym_sessions.
+    stop = asyncio.Event()
+    task = asyncio.create_task(gym.cv_event_subscriber(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 app = FastAPI(
@@ -75,6 +88,7 @@ app.include_router(users.router)
 app.include_router(patients.router)
 app.include_router(alerts.router)
 app.include_router(sessions.router)
+app.include_router(gym.router)
 app.include_router(ai.router)
 
 

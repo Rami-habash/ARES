@@ -20,7 +20,7 @@ export default function AppShell() {
 
   const views: Record<NavItem, React.ReactNode> = {
     dashboard: <DashboardView setActiveView={setActiveView} setSelectedPatient={setSelectedPatient} demo={demo} />,
-    'room-monitor': <RoomMonitorView setActiveView={setActiveView} setSelectedPatient={setSelectedPatient} selectedPatient={selectedPatient} demo={demo} />,
+    'room-monitor': <RoomMonitorView />,
     patients: <PatientsView setActiveView={setActiveView} setSelectedPatient={setSelectedPatient} demo={demo} />,
     exercise: <ExerciseDetailView selectedPatient={selectedPatient} />,
     alerts: <AlertsView />,

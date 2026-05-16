@@ -66,9 +66,26 @@ def init_db(path: Path = DB_PATH) -> None:
                 created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
             );
 
+            -- Live "is the patient currently in the gym" state. Distinct from
+            -- session_logs (post-hoc exercise summaries) — gym_sessions tracks
+            -- the live ArUco-bound presence in the room.
+            -- state: CHECKING_IN | ACTIVE | LOST | LEFT
+            CREATE TABLE IF NOT EXISTS gym_sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id  TEXT    NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+                state       TEXT    NOT NULL DEFAULT 'CHECKING_IN',
+                started_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                ended_at    TEXT,
+                last_event  TEXT,
+                updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_alerts_patient
                 ON alerts(patient_id, created_at);
 
             CREATE INDEX IF NOT EXISTS idx_sessions_patient
                 ON session_logs(patient_id, session_date);
+
+            CREATE INDEX IF NOT EXISTS idx_gym_sessions_patient
+                ON gym_sessions(patient_id, started_at);
         """)

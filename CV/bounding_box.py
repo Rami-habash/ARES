@@ -1,3 +1,4 @@
+import os
 import sys
 import cv2
 
@@ -5,19 +6,24 @@ DEFAULT_MODEL      = "yolo11l.pt"
 DEFAULT_CONFIDENCE = 0.5
 PERSON_CLASS       = 0
 
+# BoT-SORT with appearance ReID — tracks survive ~2s of occlusion (track_buffer)
+# and re-identify by CLIP embedding rather than IoU alone.
+_TRACKER_CONFIG = os.path.join(os.path.dirname(__file__), "botsort.yaml")
+
 
 def load_model(model_name: str = DEFAULT_MODEL):
     from ultralytics import YOLO
     return YOLO(model_name)
 
 
-def extract_bounding_boxes(model, frame, confidence_threshold: float):
+def extract_bounding_boxes(model, frame, confidence_threshold: float, tracker: str = _TRACKER_CONFIG):
     results = model.track(
         frame,
         persist=True,
         classes=[PERSON_CLASS],
         conf=confidence_threshold,
         iou=0.45,
+        tracker=tracker,
         verbose=False,
     )
     return results[0].boxes if results and results[0].boxes is not None else []

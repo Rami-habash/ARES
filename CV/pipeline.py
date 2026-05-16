@@ -11,13 +11,6 @@ Startup
   preload_models()                                         warm all models
   preload_references(reference_dir?)                       warm reference cache
 
-Patient management
-  scan_persons(video_path)                                 → list[PersonResult]
-  register_patient(video_path, name, exercises?)           → str (patient_id)
-  get_patient(patient_id)                                  → PatientResult
-  list_patients()                                          → list[PatientResult]
-  assign_exercises(patient_id, exercises)
-
 Movement analysis — single person
   classify_movement(video_path, track_id, ...)             → MovementResult
   get_movement_context(video_path, track_id, ...)          → OODContext
@@ -31,20 +24,16 @@ OOD / reference quality (agent internet-retrieval flow)
                                                            → ReferenceCheckResult
   add_exercise_reference(video_path, exercise_name, ref_dir?)
 
-Multi-patient streaming (requires scan_persons to have been called first)
-  track_all_patients(video_path, on_frame?)                → dict[patient_id, list[PatientFrame]]
-  track_and_log_patient(video_path, patient_id, on_frame?) → list[PatientFrame]
+Identity (live)
+  Patient identity is bound on the live stream via ArUco markers shown on
+  the patient's phone — see identity.py and live_session.py. CV holds no
+  persistent patient store; the backend owns patient CRUD.
 """
 
 from __future__ import annotations
 
-import sys as _sys
-_sys.modules.setdefault("tensorflow", None)  # prevents keras→pandas→pyarrow mutex crash with ONNX Runtime on macOS
-
-import json
 import shutil
 from collections import defaultdict
-from collections.abc import Callable
 from pathlib import Path
 from typing import TypedDict
 
@@ -53,7 +42,6 @@ import numpy as np
 import torch
 
 import bounding_box
-import face_id
 import form_analysis
 import keypoint_extraction
 import video_embeder
@@ -72,20 +60,6 @@ DEFAULT_REF_DIR = Path(__file__).parent / "workout_videos"
 VIDEO_EXTS      = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 # ── Return Types ──────────────────────────────────────────────────────────────
-
-class PersonResult(TypedDict):
-    track_id:     int
-    patient_id:   str
-    patient_name: str | None
-    is_new:       bool
-    confidence:   float
-
-
-class PatientResult(TypedDict):
-    patient_id:         str
-    name:               str
-    assigned_exercises: list[str]
-
 
 class MovementResult(TypedDict):
     prediction:  str | None        # best label, or None if OOD
@@ -138,15 +112,6 @@ class FormResult(TypedDict):
     coaching_notes:      str | None     # None here; populated by the agent layer
 
 
-class PatientFrame(TypedDict):
-    """One frame of activity data for a single patient — building block for logs."""
-    timestamp_ms: int
-    frame_idx:    int
-    track_id:     int
-    bbox:         tuple[int, int, int, int]   # x1, y1, x2, y2
-    keypoints:    list[Landmark]              # empty list if pose not detected
-
-
 # ── Model Singletons ──────────────────────────────────────────────────────────
 
 _models: dict = {}
@@ -164,12 +129,6 @@ def _s3d():
     return _models["s3d"]
 
 
-def _face():
-    if "face" not in _models:
-        _models["face"] = face_id.load_model()
-    return _models["face"]
-
-
 def _pose():
     if "pose" not in _models:
         _models["pose"] = keypoint_extraction.load_model()
@@ -178,9 +137,7 @@ def _pose():
 
 def preload_models() -> None:
     """Eagerly initialise all models. Call once at startup to avoid first-call latency."""
-    # face (ONNX Runtime) and bbox (YOLO) must initialize before PyTorch claims the MPS
-    # thread pool — on macOS this ordering prevents a mutex lock crash at startup.
-    _face(); _bbox(); _pose(); _s3d()
+    _bbox(); _pose(); _s3d()
 
 
 # ── Reference Embedding Cache ─────────────────────────────────────────────────
@@ -224,13 +181,6 @@ def _load_reference_embeddings(reference_dir: str | None = None) -> dict[str, np
 def preload_references(reference_dir: str | None = None) -> None:
     """Pre-load and cache all reference video embeddings."""
     _load_reference_embeddings(reference_dir)
-
-
-# ── Session State ─────────────────────────────────────────────────────────────
-# scan_persons populates this map so track_and_log_patient / track_all_patients
-# can be called with just a patient_id.
-
-_session_track_map: dict[str, int] = {}   # patient_id → track_id
 
 
 # ── Internal Helpers ──────────────────────────────────────────────────────────
@@ -300,119 +250,6 @@ def _landmarks_from_crop(crop: np.ndarray, timestamp_ms: int) -> list[Landmark]:
         Landmark(x=lm.x, y=lm.y, z=lm.z, visibility=getattr(lm, "visibility", 1.0))
         for lm in lm_list[0]
     ]
-
-
-def _track_patients(
-    video_path: str,
-    patient_ids: set[str],
-    on_frame: Callable[[str, PatientFrame], None] | None = None,
-) -> dict[str, list[PatientFrame]]:
-    """Single YOLO+MediaPipe pass tracking a subset of session patients."""
-    track_to_patient = {
-        _session_track_map[pid]: pid
-        for pid in patient_ids
-        if pid in _session_track_map
-    }
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    logs: dict[str, list[PatientFrame]] = {pid: [] for pid in patient_ids}
-    frame_idx = 0
-
-    while cap.isOpened():
-        ok, frame = cap.read()
-        if not ok:
-            break
-        h, w = frame.shape[:2]
-        timestamp_ms = int(frame_idx * (1000.0 / fps))
-
-        for box in bounding_box.extract_bounding_boxes(_bbox(), frame, 0.5):
-            if box.id is None:
-                continue
-            tid = int(box.id[0])
-            patient_id = track_to_patient.get(tid)
-            if patient_id is None:
-                continue
-
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-            crop = frame[y1:y2, x1:x2]
-            keypoints = _landmarks_from_crop(crop, timestamp_ms) if crop.size > 0 else []
-
-            pf = PatientFrame(
-                timestamp_ms=timestamp_ms,
-                frame_idx=frame_idx,
-                track_id=tid,
-                bbox=(x1, y1, x2, y2),
-                keypoints=keypoints,
-            )
-            logs[patient_id].append(pf)
-            if on_frame:
-                on_frame(patient_id, pf)
-
-        frame_idx += 1
-
-    cap.release()
-    return logs
-
-
-# ── Patient Management ────────────────────────────────────────────────────────
-
-def scan_persons(video_path: str) -> list[PersonResult]:
-    """
-    Scan a video for all persons.
-    - Known patients are matched by face and returned with their patient_id.
-    - Unknown persons are auto-enrolled (is_new=True) and given a new patient_id.
-
-    Also establishes the session track map so track_and_log_patient /
-    track_all_patients can be called with just a patient_id.
-    """
-    global _session_track_map
-    persons = face_id.identify_persons_in_video(_face(), _bbox(), video_path)
-    _session_track_map = {p["patient_id"]: p["track_id"] for p in persons}
-    return persons
-
-
-def register_patient(
-    video_path: str,
-    name: str,
-    exercises: list[str] | None = None,
-) -> str:
-    """
-    Enroll a new patient from a short face video (5–15 s recommended).
-    Optionally assign their rehab exercises immediately.
-    Returns patient_id.
-    """
-    patient_id = face_id.register_patient(_face(), video_path, name)
-    if exercises:
-        assign_exercises(patient_id, exercises)
-    return patient_id
-
-
-def get_patient(patient_id: str) -> PatientResult:
-    """Return a patient's profile including name and assigned exercises."""
-    meta = face_id._read_metadata(patient_id)
-    if not meta:
-        raise ValueError(f"No patient found with id '{patient_id}'.")
-    return PatientResult(
-        patient_id=meta.get("id", patient_id),
-        name=meta.get("name", "Unknown"),
-        assigned_exercises=meta.get("assigned_exercises", []),
-    )
-
-
-def list_patients() -> list[PatientResult]:
-    """Return profiles for all registered patients."""
-    return [get_patient(pid) for pid in face_id.load_patient_db()]
-
-
-def assign_exercises(patient_id: str, exercises: list[str]) -> None:
-    """Set (or overwrite) the rehab exercise list for a patient."""
-    path = face_id.FACE_DB_DIR / patient_id / "metadata.json"
-    if not path.exists():
-        raise ValueError(f"No patient found with id '{patient_id}'.")
-    meta = json.loads(path.read_text())
-    meta["assigned_exercises"] = exercises
-    path.write_text(json.dumps(meta, indent=2))
 
 
 # ── Movement Analysis — Single Person ─────────────────────────────────────────
@@ -637,43 +474,3 @@ def add_exercise_reference(
     _ref_cache = None   # force reload so the new class is picked up
 
 
-# ── Multi-patient Streaming ───────────────────────────────────────────────────
-
-def track_all_patients(
-    video_path: str,
-    on_frame: Callable[[str, PatientFrame], None] | None = None,
-) -> dict[str, list[PatientFrame]]:
-    """
-    Process a full video for ALL patients in one YOLO+MediaPipe pass.
-    More efficient than calling track_and_log_patient per patient.
-
-    Requires scan_persons to have been called first for this video.
-
-    on_frame(patient_id, PatientFrame) is called per frame in real time —
-    use this for live feedback without waiting for the full video to finish.
-
-    Returns {patient_id: [PatientFrame, ...]} for every patient in the session.
-    """
-    if not _session_track_map:
-        raise ValueError("No active session. Call scan_persons first.")
-    return _track_patients(video_path, set(_session_track_map.keys()), on_frame)
-
-
-def track_and_log_patient(
-    video_path: str,
-    patient_id: str,
-    on_frame: Callable[[PatientFrame], None] | None = None,
-) -> list[PatientFrame]:
-    """
-    Stream per-frame pose + bbox data for a single patient.
-    Requires scan_persons to have been called first.
-
-    on_frame(PatientFrame) is called per frame in real time — use this for
-    live feedback or logging without waiting for the full video.
-
-    Returns the complete list of PatientFrames for the patient.
-    """
-    if patient_id not in _session_track_map:
-        raise ValueError(f"Patient '{patient_id}' not in current session. Call scan_persons first.")
-    wrapped = (lambda pid, pf: on_frame(pf)) if on_frame else None
-    return _track_patients(video_path, {patient_id}, wrapped)[patient_id]
