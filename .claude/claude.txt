@@ -1,0 +1,305 @@
+# Claude Context File — ARES / Solstice Project
+# Last updated: 2026-05-16
+
+## What this project is
+
+ARES is an AI-powered gym and physical therapy monitoring system called **Solstice**.
+It uses a ceiling/room camera to track patients doing exercises in real time, identifies
+their movements, compares form against references, and coaches them via an AI agent.
+At session end, a doctor/PT can generate a clinical report from the session.
+
+Built by a 4-person hackathon team. Stack: CV pipeline + FastAPI backend + Next.js frontend
++ NemoClaw/OpenClaw AI agent (Solstice).
+
+GitHub: https://github.com/Rami-habash/ARES.git
+
+---
+
+## VM (Brev)
+
+- Instance name: nemoclaw-0349a4
+- Instance ID: j7yk6jdzw
+- IP: 136.109.205.1
+- SSH: `brev shell nemoclaw-0349a4` or `ssh ubuntu@136.109.205.1`
+- Remote exec: `brev exec nemoclaw-0349a4 -- "<cmd>"`
+- Project lives at: /home/ubuntu/ARES
+
+---
+
+## Sandboxes (NemoClaw)
+
+Two sandboxes on the VM:
+
+| Name      | Model                                       | Status  | Notes                     |
+|-----------|---------------------------------------------|---------|---------------------------|
+| nemo-ares | nvidia/nemotron-3-nano-omni-30b-a3b-reasoning | default | USE THIS — fast (~4-5s)  |
+| nemo-demo | nvidia/nemotron-3-super-120b-a12b            | old     | Ignore — 30s/response     |
+
+Key commands:
+```bash
+nemoclaw list                        # list sandboxes
+nemoclaw nemo-ares status            # health check
+nemoclaw nemo-ares connect           # SSH into sandbox
+openclaw tui                         # interactive chat (run inside sandbox)
+```
+
+---
+
+## Architecture
+
+```
+Patient phone (/patient/* pages)
+  └── POST /gym/check_in → backend (FastAPI :8000)
+        └── POST /live/check_in → CV (FastAPI :8001)
+              └── YOLO11 + BoT-SORT + ArUco detection
+                    └── ArUco marker seen → patient_checked_in event
+                          └── WS /live/events → backend (mirrors to gym_sessions)
+
+form_monitor_daemon.py (runs on host)
+  └── webcam → 2s clips → FormMonitor.tick → exercise/form events
+        └── openshell sandbox exec -n nemo-ares -- openclaw agent --to +10000000001 --message "..."
+              └── Solstice agent (nano-30b) → 1-sentence coaching reply
+                    ├── broadcast_coaching() → WS :8765 → frontend coaching feed
+                    └── add_session_memory() → SQLite (claw/data/patients.db)
+
+poll_session_state() (in daemon)
+  └── polls GET /gym every 3s
+        └── patient disappears (state=LEFT) → _fire_session_ended() → agent
+
+Admin frontend (/dashboard → Room Monitor)
+  └── useLiveSecurityStream: webcam → WebRTC → CV → bbox overlay
+  └── useGymSessions: polls /gym for patient state
+  └── useCoachingFeed: WS ws://localhost:8765 → coaching text display
+  └── "End session + report" button → POST /gym/{id}/report
+        └── backend reads session memories → calls openclaw agent → returns markdown report
+              └── modal shows report
+```
+
+---
+
+## Identity model (no face recognition)
+
+1. Patient opens /patient/check-in → taps Check In
+2. Backend creates gym_session (CHECKING_IN), tells CV to watch for marker
+3. Patient goes to /patient/marker — shows fullscreen ArUco marker on phone
+4. Patient holds phone up to camera
+5. CV's security worker detects ArUco marker inside a YOLO bbox → binds track_id ↔ patient_id
+6. Backend flips state to ACTIVE
+7. Patient goes out of frame >7s → LOST (not done, just lost)
+8. Patient taps "I'm still here" → re-arms marker watch → back to ACTIVE
+9. Patient taps "I'm leaving" → LEFT (this is the only real session-end signal)
+
+---
+
+## Services and ports
+
+| Service  | Port | Start command                                              |
+|----------|------|------------------------------------------------------------|
+| Backend  | 8000 | cd ARES/backend && uvicorn app.main:app --port 8000        |
+| CV       | 8001 | cd ARES/CV && uvicorn api:app --host 0.0.0.0 --port 8001  |
+| Frontend | 3000 | cd ARES/frontend && npm run dev                            |
+| Daemon   | —    | cd ARES/claw && python3 form_monitor_daemon.py --patient P001 --source 0 |
+| Coaching WS | 8765 | started automatically by daemon                         |
+
+All run via tmux on the VM: `tmux new-session -s ares`
+Port forward to local: `ssh -f -N -L 3000:localhost:3000 ubuntu@136.109.205.1`
+
+---
+
+## ARES file structure
+
+```
+ARES/
+├── CV/                          # Computer vision pipeline
+│   ├── api.py                   # FastAPI: /live/start_webrtc, /live/ws, /live/events,
+│   │                            #          /live/check_in, /live/checkout, /live/marker.png
+│   ├── live_session.py          # LiveSession: manages streams, workers, IdentityRegistry
+│   ├── identity.py              # ArUco detection, track_id↔patient_id binding, event emitter
+│   ├── bounding_box.py          # YOLO11 + BoT-SORT tracker
+│   ├── botsort.yaml             # BoT-SORT config (with_reid=True, CLIP-ReID embeddings)
+│   ├── form_monitor.py          # State machine: WAITING→IDENTIFYING→MONITORING
+│   ├── keypoint_extraction.py   # MediaPipe pose keypoints
+│   └── requirements.txt
+│
+├── backend/
+│   └── app/
+│       ├── main.py              # FastAPI app + cv_event_subscriber lifespan task
+│       ├── routers/
+│       │   ├── gym.py           # /gym/* endpoints: check_in, still_here, leave, report
+│       │   └── ...              # auth, patients, sessions, exercises
+│       ├── db/database.py       # SQLite: gym_sessions table (CHECKING_IN/ACTIVE/LOST/LEFT)
+│       └── core/config.py       # CV_INTERNAL_BASE, CV_API_BASE env vars
+│
+├── claw/                        # NemoClaw/OpenClaw agent config and daemon
+│   ├── AGENTS.md                # Agent behavioral spec (pushed to sandbox workspace)
+│   ├── SOUL.md                  # Agent persona (pushed to sandbox workspace)
+│   ├── TOOLS.md                 # Tool descriptions (pushed to sandbox workspace)
+│   ├── form_monitor_daemon.py   # Main daemon: capture→process→agent→broadcast
+│   ├── form_monitor.py          # FormMonitor state machine
+│   ├── exercise_identifier.py   # S3D embedding classifier
+│   ├── patient_profile/
+│   │   └── profile.py           # SQLite: patients, session_memories tables
+│   ├── data/patients.db         # Patient + session memory database
+│   └── skills/
+│       ├── datetime/SKILL.md    # Datetime skill (installed in sandbox)
+│       └── session-report/SKILL.md  # Clinical report skill (installed in sandbox)
+│
+├── frontend/                    # Next.js 15 app
+│   └── src/
+│       ├── app/
+│       │   ├── dashboard/       # Admin views
+│       │   └── patient/         # Patient lifecycle pages (check-in, marker, lost)
+│       ├── components/
+│       │   └── room-monitor/
+│       │       ├── LiveInspector.tsx    # Side panel: patients, coaching feed, End Session button
+│       │       ├── LiveCameraCanvas.tsx # Webcam + bbox overlay
+│       │       └── RoomMonitorView.tsx  # Composes the room monitor
+│       └── hooks/
+│           ├── useLiveSecurityStream.ts # WebRTC capture + /live/ws subscription
+│           ├── useGymSessions.ts        # Polls /gym for patient state
+│           └── useCoachingFeed.ts       # WS ws://localhost:8765 → coaching messages
+│
+├── setup_vm.sh                  # One-shot VM setup script (see below)
+└── install.sh                   # Python/CV deps installer (older, kept for reference)
+```
+
+---
+
+## The Solstice agent (OpenClaw in nemo-ares sandbox)
+
+**Workspace files** (in sandbox at /sandbox/.openclaw/workspace/):
+- AGENTS.md — behavioral rules, event handling, session_ended → report generation
+- SOUL.md — persona: grounded PT coach, one sentence per event
+- TOOLS.md — describes available tools
+
+**Skills** (in sandbox at /sandbox/.openclaw/skills/):
+- datetime — system clock
+- session-report — clinical report format for session_ended events
+
+**How the daemon talks to the agent:**
+```bash
+openshell -g nemoclaw sandbox exec -n nemo-ares -- \
+  openclaw agent --to +10000000001 --message "[form_monitor] ..." --json
+```
+Session key `+10000000001` is fixed so all form events share one conversation context.
+
+**Report generation** (triggered by "End session + report" button):
+- `POST /gym/{id}/report` in backend
+- Reads session_memories from claw/data/patients.db
+- Builds report structure in code (exercises, form issues, coaching given)
+- Asks agent only for recommendations (focused task, nano-30b handles it well)
+- Returns markdown, shown in modal
+
+**Known agent limitation:** nano-30b model doesn't reliably follow "output exactly this string"
+instructions. Always give it a focused, specific task rather than complex formatting directives.
+The report endpoint works around this by doing formatting in Python and only asking the agent
+for the recommendations section.
+
+---
+
+## Session memory
+
+The daemon calls `add_session_memory(patient_id, highlight)` after each `patient_paused` event.
+Format: `"exercise | coaching cue"` e.g. `"squat | keep chest up at the bottom"`
+Stored in: `claw/data/patients.db` → `session_memories` table
+Used by: `POST /gym/{id}/report` to build the clinical report
+
+---
+
+## Environment variables
+
+```bash
+NVIDIA_API_KEY=nvapi-...          # Required everywhere — NVIDIA inference API
+CV_INTERNAL_BASE=http://localhost:8001   # backend→CV (internal, no ngrok)
+CV_API_BASE=https://<ngrok-host>         # phone-facing (needs HTTPS for mobile Safari)
+NEXT_PUBLIC_API_BASE=http://localhost:8000
+NEXT_PUBLIC_CV_BASE=https://<ngrok-host>    # for marker PNG + WebRTC offer
+NEXT_PUBLIC_CV_WS_BASE=http://localhost:8001  # for /live/ws (direct, avoid ngrok)
+```
+
+NVIDIA_API_KEY is stored in /home/ubuntu/.bashrc on the VM.
+
+---
+
+## Pushing workspace files to sandbox
+
+The `openshell sandbox exec` stdin pipe approach works when run locally on the VM
+but fails over `brev exec` (brev backgrounds stdin commands). Use Python subprocess:
+
+```python
+import subprocess
+content = open('claw/AGENTS.md').read()
+subprocess.run(
+    ['openshell', '-g', 'nemoclaw', 'sandbox', 'exec', '-n', 'nemo-ares', '--',
+     'sh', '-c', 'cat > /sandbox/.openclaw/workspace/AGENTS.md'],
+    input=content, text=True, timeout=30
+)
+```
+
+Or use base64 transfer:
+```bash
+cat file.md | base64 | brev exec nemoclaw-0349a4 -- "base64 -d > /tmp/file.md"
+brev exec nemoclaw-0349a4 -- "python3 /tmp/push_script.py"
+```
+
+---
+
+## Setting up a new VM
+
+```bash
+git clone https://github.com/Rami-habash/ARES.git
+cd ARES
+export NVIDIA_API_KEY=nvapi-...
+bash setup_vm.sh
+```
+
+setup_vm.sh handles:
+- System deps (libgl, libglib, etc.)
+- Docker + DNS fix for filtered networks
+- Node.js 22
+- Python deps for CV and backend
+- Frontend npm install
+- NemoClaw install + interactive onboard (pick nvidia-prod + nano model)
+- Waits for sandbox to be Ready
+- Pushes AGENTS.md, SOUL.md, TOOLS.md to sandbox workspace
+- Installs datetime and session-report skills
+- Seeds patient DB with demo patients (P001 Alice, P002 Marcus, P003 Priya, P004 Diego)
+
+After setup, for GPU VM: CV will use CUDA automatically via ultralytics/PyTorch.
+For the daemon, install riva-client for TTS (NVIDIA Magpie/Aria voice):
+```bash
+pip3 install nvidia-riva-client
+```
+
+---
+
+## Key gotchas
+
+- `nemoclaw connect` resets the inference model to whatever was baked in at onboard time.
+  Don't run it expecting to switch models — re-onboard to change the model permanently.
+- eduroam/university DNS blocks clawhub.ai — Docker daemon needs {"dns":["8.8.8.8","1.1.1.1"]}
+- `brev exec` with heredoc/stdin runs commands in the background and produces no output.
+  Use base64 transfer + run a script file instead.
+- BoT-SORT downloads CLIP-ReID weights on first frame — first run takes 10-20s.
+- ArUco detector params in identity.py are tuned for phone LCD screens. Change rooms/lighting
+  → may need to tweak polygonalApproxAccuracyRate and adaptive threshold window.
+- Patient routes in gym.py are currently unauthenticated (TODO in the file).
+- The coaching WebSocket (port 8765) is started by the daemon — frontend shows "No coaching yet"
+  until the daemon is running.
+- Session memories are in-process on the daemon side. CV restart wipes the identity registry
+  but the marker page re-arms on mount so this self-heals.
+
+---
+
+## Demo flow (end to end)
+
+1. Start all services (backend :8000, CV :8001, frontend :3000, daemon)
+2. Admin opens /dashboard → Room Monitor → clicks Start broadcast
+3. Patient opens /patient/check-in on phone → taps Check In
+4. Patient goes to /patient/marker — shows ArUco marker to camera
+5. Within ~1s: patient card in Room Monitor shows Active, coaching starts
+6. Agent gives one-sentence coaching as patient exercises
+7. Patient walks out of frame >7s → Lost state, marker page prompts
+8. Patient taps "I'm still here" → back to Active
+9. Patient taps "I'm leaving" → session ends, daemon detects LEFT, stops
+10. Admin clicks "End session + report" → clinical report modal appears
