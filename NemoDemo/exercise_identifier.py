@@ -153,48 +153,34 @@ def _build_ood_prompt(
         for ex, score in sorted(all_scores.items(), key=lambda x: -x[1])
     )
     untried = [e for e in KAGGLE_EXERCISES if e not in already_tried]
-    catalog_lines = "\n".join(f"  - {e}" for e in untried)
+    catalog_str = ", ".join(untried)
 
     return textwrap.dedent(f"""
-        You are an expert exercise-recognition reasoning engine.
+        A patient is performing an exercise. We tested several exercises
+        against video embeddings and got these cosine similarity scores
+        (threshold for a confident match = {THRESHOLD}):
 
-        A patient is performing a physical motion that could not be confidently
-        matched to any reference video. The cosine similarity threshold for a
-        confident match is {THRESHOLD}.
-
-        The exercise MUST be one of the exercises in the untested catalog list
-        below — it is guaranteed to be there.
-
-        ## Patient's prescribed exercises
-        {', '.join(patient_exercises)}
-
-        ## Similarity scores collected so far (higher = more similar)
         {scored_lines}
 
-        ## Exercises in the catalog not yet tested
-        {catalog_lines}
+        None matched. The exercise must be one of these untested options:
+        {catalog_str}
 
-        ## Your task
-        Think step-by-step:
+        IMPORTANT:
+        - Embedding similarity is noisy. The actual exercise may have a
+          completely different movement pattern from the highest-scoring
+          tested exercises. Do NOT just pick exercises similar to the top
+          score — consider pushing, pulling, rotation, and upper-body
+          movements as well as lower-body.
+        - Cover a diverse range of movement patterns in your picks.
 
-        1. Examine which exercises scored highest and identify their shared
-           movement patterns (e.g. leg drive, hip hinge, pushing, pulling,
-           rotation, isometric hold, knee flexion, shoulder abduction).
-        2. Consider which untested catalog exercises share those movement
-           characteristics and could explain the observed similarity pattern.
-        3. Think about biomechanical relationships: exercises that recruit the
-           same muscle groups or share the same joint actions tend to produce
-           similar embeddings.
-        4. Rank the untested exercises from most to least likely to match.
-        5. Select up to 5 candidates to test next — prioritize exercises most
-           likely to cross the {THRESHOLD} threshold.
+        Output a JSON array of exactly 5 exercise names from the untested
+        list above, ordered by your best guess of likelihood. Example
+        output format (do NOT include this exact answer, this is just
+        a format example):
 
-        Respond ONLY with a JSON array of exercise names (strings) from the
-        untested catalog list, ordered by priority.  Example:
-        ["squat", "leg press", "romanian deadlift"]
+        ["push-up", "pull up", "deadlift", "russian twist", "lateral raise"]
 
-        Do not include already-tested exercises. Do not add any commentary
-        outside the JSON array.
+        Output ONLY the JSON array. No preamble, no explanation.
     """).strip()
 
 
@@ -206,25 +192,31 @@ def _ask_nemotron(prompt: str) -> list[str]:
 
     response = client.chat.completions.create(
         model=NEMOTRON_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        # System message disables Nemotron's reasoning mode so the model
+        # commits to a direct answer instead of spinning in circles.
+        messages=[
+            {"role": "system", "content": "detailed thinking off"},
+            {"role": "user", "content": prompt},
+        ],
         temperature=0.2,
-        max_tokens=512,
+        max_tokens=1024,
     )
-    raw = response.choices[0].message.content or ""
-    logger.debug("Nemotron reply: %s", raw)
+    msg = response.choices[0].message
+    raw = msg.content or getattr(msg, "reasoning_content", None) or ""
+    logger.info("Nemotron raw reply: %s", raw)
 
-    match = re.search(r"\[.*?\]", raw, re.DOTALL)
-    if not match:
-        logger.warning("Nemotron reply contained no JSON array.")
-        return []
-    try:
-        candidates = json.loads(match.group())
-        if not isinstance(candidates, list):
-            return []
-        return [c for c in candidates if isinstance(c, str)]
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse Nemotron JSON reply.")
-        return []
+    # Find all bracketed candidates; try them from longest to shortest so we
+    # prefer the full answer array over any incidental list-like fragments.
+    matches = sorted(re.findall(r"\[[^\[\]]*\]", raw, re.DOTALL), key=len, reverse=True)
+    for m in matches:
+        try:
+            candidates = json.loads(m)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidates, list):
+            return [c for c in candidates if isinstance(c, str)]
+    logger.warning("Nemotron reply contained no parseable JSON array.")
+    return []
 
 
 # ---------------------------------------------------------------------------
