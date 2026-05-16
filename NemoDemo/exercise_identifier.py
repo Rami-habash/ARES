@@ -2,45 +2,53 @@
 
 Flow
 ----
-1. In-domain pass
-   Call pipeline.classify_movement with the patient's prescribed exercises as
-   the only reference videos on disk.  If it returns a prediction (score ≥ 0.75),
-   return that exercise name immediately.
+1. Embed the query video with S3D (full frame, no YOLO person crop needed).
+2. In-domain pass: compare against up to REFS_PER_EXERCISE reference videos
+   for each of the patient's prescribed exercises.  If the best mean cosine
+   similarity score is >= THRESHOLD, return that exercise name immediately.
+3. OOD loop: pass all scores so far to Nemotron 3 Nano, which reasons about
+   which untested catalog exercises to try next.  Score those candidates.
+   Repeat until a match is found (the exercise is guaranteed to be in the
+   Kaggle catalog).
 
-2. Out-of-domain (OOD) loop
-   Call pipeline.get_movement_context to get the full similarity scores.
-   Pass them to Nemotron 3 Nano, which reasons about which untested catalog
-   exercises to try next.  For each candidate batch, temporarily copy the
-   candidate videos into the reference dir so pipeline.classify_movement can
-   score them.  Repeat until a match is found.
-
-   The exercise is guaranteed to exist in the Kaggle catalog, so the loop
-   terminates with a match once the right exercise is reached.
+Why no YOLO / track_id
+-----------------------
+pipeline.classify_movement crops the query person using YOLO track IDs.
+Track IDs are only stable within a single YOLO tracker session — calling
+track() twice on the same video produces different IDs each time.  For
+exercise identification we only need the motion pattern, not person isolation,
+so we embed the full video frame directly with video_embeder.embed().
 
 Reference video layout (NemoDemo/data/videos/)
 ----------------------------------------------
 Only the 11 exercises assigned across all patient profiles have folders here.
 The remaining 11 catalog exercises have no videos — that absence is what
 triggers the OOD path when a patient does something outside their prescription.
+
+Embedding cache
+---------------
+Reference embeddings are cached as .pt files under data/embeddings/ so
+subsequent runs are near-instant for already-seen videos.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import sys
 import textwrap
 from pathlib import Path
 
+import numpy as np
+import torch
+
 from openai import OpenAI
 
-# CV pipeline lives one level up in CV/
 _CV_DIR = Path(__file__).resolve().parent.parent / "CV"
 if str(_CV_DIR) not in sys.path:
     sys.path.insert(0, str(_CV_DIR))
 
-import pipeline  # noqa: E402 — CV pipeline
+import video_embeder  # noqa: E402
 
 from patient_profile import KAGGLE_EXERCISES, get_patient_profile  # noqa: E402
 
@@ -50,16 +58,50 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-THRESHOLD    = 0.75
-VIDEO_ROOT   = Path(__file__).resolve().parent / "data" / "videos"
+THRESHOLD         = 0.75
+REFS_PER_EXERCISE = 5
+VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
+EMBED_CACHE_ROOT  = Path(__file__).resolve().parent / "data" / "embeddings"
 
 NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 NEMOTRON_MODEL  = "nvidia/nemotron-3-nano-30b-a3b"
 
 # ---------------------------------------------------------------------------
-# Reference dir helpers
+# S3D model singleton
 # ---------------------------------------------------------------------------
+
+_s3d_model = None
+
+def _s3d():
+    global _s3d_model
+    if _s3d_model is None:
+        _s3d_model = video_embeder.load_model()
+    return _s3d_model
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers (with disk cache)
+# ---------------------------------------------------------------------------
+
+def _cache_path(video_path: Path) -> Path:
+    try:
+        rel = video_path.relative_to(VIDEO_ROOT)
+    except ValueError:
+        rel = Path(video_path.name)
+    return EMBED_CACHE_ROOT / rel.parent / (rel.stem + ".pt")
+
+
+def _embed(video_path: Path) -> np.ndarray:
+    """S3D embed a video, reading from disk cache if available."""
+    cache = _cache_path(video_path)
+    if cache.exists():
+        return torch.load(cache, weights_only=True).numpy()
+    emb = video_embeder.embed(_s3d(), str(video_path))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.from_numpy(emb), cache)
+    return emb
+
 
 def _exercise_has_videos(exercise_name: str) -> bool:
     folder = VIDEO_ROOT / exercise_name
@@ -67,8 +109,34 @@ def _exercise_has_videos(exercise_name: str) -> bool:
 
 
 def _available_exercises(names: list[str]) -> list[str]:
-    """Filter to exercises that actually have reference videos on disk."""
     return [n for n in names if _exercise_has_videos(n)]
+
+
+def _sample_reference_videos(exercise_name: str) -> list[Path]:
+    """Return up to REFS_PER_EXERCISE .mp4s, preferring already-cached embeds."""
+    folder = VIDEO_ROOT / exercise_name
+    if not folder.is_dir():
+        return []
+    all_mp4s = sorted(f for f in folder.iterdir() if f.suffix.lower() == ".mp4")
+    if not all_mp4s:
+        return []
+    cached = [vf for vf in all_mp4s if _cache_path(vf).exists()]
+    pool = cached + [f for f in all_mp4s if f not in cached]
+    return pool[:REFS_PER_EXERCISE]
+
+
+def _score_exercises(query_emb: np.ndarray, exercises: list[str]) -> dict[str, float]:
+    """Cosine similarity between query and the mean embedding for each exercise."""
+    scores: dict[str, float] = {}
+    for ex in exercises:
+        vids = _sample_reference_videos(ex)
+        if not vids:
+            continue
+        ref_embs = np.stack([_embed(vf) for vf in vids])
+        score = float(np.mean(ref_embs @ query_emb))
+        scores[ex] = round(score, 4)
+        logger.debug("  %s → %.4f  (%d refs)", ex, score, len(vids))
+    return scores
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +149,8 @@ def _build_ood_prompt(
     already_tried: set[str],
 ) -> str:
     scored_lines = "\n".join(
-        f"  {ex}: {score:.4f}" for ex, score in sorted(all_scores.items(), key=lambda x: -x[1])
+        f"  {ex}: {score:.4f}"
+        for ex, score in sorted(all_scores.items(), key=lambda x: -x[1])
     )
     untried = [e for e in KAGGLE_EXERCISES if e not in already_tried]
     catalog_lines = "\n".join(f"  - {e}" for e in untried)
@@ -162,11 +231,8 @@ def _ask_nemotron(prompt: str) -> list[str]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def identify_exercise(patient_id: str, query_video_path: str, track_id: int) -> str | None:
+def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
     """Identify the exercise being performed in *query_video_path*.
-
-    track_id must come from pipeline.scan_persons called on the same video
-    immediately before this function.
 
     Returns the matched exercise name, or None only if reference videos are
     missing for all candidates (should not happen in a properly seeded setup).
@@ -178,41 +244,30 @@ def identify_exercise(patient_id: str, query_video_path: str, track_id: int) -> 
     kaggle_catalog = list(KAGGLE_EXERCISES)
     already_tried: set[str] = set(profile.exercises)
 
+    logger.info("[%s] Embedding query video...", patient_id)
+    query_emb = _embed(Path(query_video_path))
+
     # ── 1. In-domain pass ────────────────────────────────────────────────────
-    # Only score exercises that are both prescribed and have reference videos.
     in_domain = _available_exercises(profile.exercises)
     logger.info(
-        "[%s] In-domain pass: %d / %d prescribed exercises have reference videos.",
-        patient_id, len(in_domain), len(profile.exercises),
+        "[%s] In-domain pass: scoring %d prescribed exercises.",
+        patient_id, len(in_domain),
     )
 
-    if in_domain:
-        result = pipeline.classify_movement(
-            query_video_path,
-            track_id=track_id,
-            reference_dir=str(VIDEO_ROOT),
-            min_confidence=THRESHOLD,
-        )
-        # classify_movement scores all exercises in VIDEO_ROOT; filter to patient's
-        all_scores: dict[str, float] = {
-            k: v for k, v in result["all_scores"].items() if k in profile.exercises
-        }
+    all_scores = _score_exercises(query_emb, in_domain)
 
-        if result["prediction"] in profile.exercises:
-            logger.info(
-                "[%s] In-domain match: %r (%.4f)",
-                patient_id, result["prediction"], result["confidence"],
-            )
-            return result["prediction"]
-
-        best_score = max(all_scores.values()) if all_scores else 0.0
+    if all_scores:
+        best_ex = max(all_scores, key=lambda k: all_scores[k])
+        best_score = all_scores[best_ex]
+        if best_score >= THRESHOLD:
+            logger.info("[%s] In-domain match: %r (%.4f)", patient_id, best_ex, best_score)
+            return best_ex
         logger.info(
-            "[%s] No in-domain match (best=%.4f). Entering OOD reasoning loop.",
-            patient_id, best_score,
+            "[%s] No in-domain match (best=%s %.4f). Entering OOD loop.",
+            patient_id, best_ex, best_score,
         )
     else:
-        logger.info("[%s] No in-domain reference videos found. Going straight to OOD.", patient_id)
-        all_scores = {}
+        logger.info("[%s] No in-domain reference videos. Going straight to OOD.", patient_id)
 
     # ── 2. OOD reasoning loop ────────────────────────────────────────────────
     round_num = 0
@@ -235,7 +290,6 @@ def identify_exercise(patient_id: str, query_video_path: str, track_id: int) -> 
             logger.info("[%s] No new valid candidates. Stopping.", patient_id)
             break
 
-        # Filter to candidates that actually have videos on disk.
         testable = _available_exercises(valid_candidates)
         already_tried.update(valid_candidates)
 
@@ -244,41 +298,20 @@ def identify_exercise(patient_id: str, query_video_path: str, track_id: int) -> 
             continue
 
         logger.info("[%s] Testing: %s", patient_id, testable)
-
-        # Stage: temporarily copy candidate videos into a scratch dir so
-        # classify_movement can score all of them in one pass without
-        # interfering with the permanent reference library.
-        scratch = VIDEO_ROOT.parent / "_ood_scratch"
-        try:
-            scratch.mkdir(parents=True, exist_ok=True)
-            for ex in testable:
-                shutil.copytree(VIDEO_ROOT / ex, scratch / ex, dirs_exist_ok=True)
-
-            result = pipeline.classify_movement(
-                query_video_path,
-                track_id=track_id,
-                reference_dir=str(scratch),
-                min_confidence=THRESHOLD,
-            )
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-            pipeline._ref_cache = None  # invalidate cache after scratch dir is gone
-
-        round_scores = {k: v for k, v in result["all_scores"].items() if k in testable}
+        round_scores = _score_exercises(query_emb, testable)
         all_scores.update(round_scores)
 
-        if result["prediction"] in testable:
+        if round_scores:
+            best_ex = max(round_scores, key=lambda k: round_scores[k])
+            best_score = round_scores[best_ex]
+            if best_score >= THRESHOLD:
+                logger.info("[%s] OOD match: %r (%.4f)", patient_id, best_ex, best_score)
+                return best_ex
             logger.info(
-                "[%s] OOD match: %r (%.4f)", patient_id, result["prediction"], result["confidence"]
+                "[%s] Round %d best: %s=%.4f — continuing.",
+                patient_id, round_num, best_ex, best_score,
             )
-            return result["prediction"]
 
-        best = max(round_scores.values()) if round_scores else 0.0
-        logger.info(
-            "[%s] Round %d best: %.4f — continuing.", patient_id, round_num, best
-        )
-
-    # All candidates exhausted without a match.
     all_scores_sorted = sorted(all_scores.items(), key=lambda x: -x[1])
     logger.error(
         "[%s] Identification failed. Full score table:\n%s",

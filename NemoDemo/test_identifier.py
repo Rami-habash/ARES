@@ -3,17 +3,13 @@ End-to-end test for exercise_identifier.identify_exercise.
 
 Usage
 -----
-# In-domain test: give it a squat video for P001 (squat is prescribed)
+# In-domain: squat is prescribed for P001, expect immediate match
 python3 test_identifier.py --patient P001 --video data/videos/squat/squat_10.mp4
 
-# OOD test: give P001 a bench press video (not prescribed, not in reference library)
-# The agent should enter the OOD loop and reason its way to 'bench press'
-python3 test_identifier.py --patient P001 --video /path/to/bench_press.mp4
-
-The script:
-  1. Calls scan_persons on the query video to get the real YOLO track_id
-  2. Passes that track_id into identify_exercise
-  3. Prints the result and all timing
+# OOD: bench press is not prescribed and has no reference video on disk;
+# Nemotron should reason its way to it
+python3 test_identifier.py --patient P001 \
+  --video ~/.cache/kagglehub/datasets/hasyimabdillah/workoutfitness-video/versions/5/bench\ press/bench_press_1.mp4
 """
 
 import argparse
@@ -28,84 +24,50 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# ── paths ──────────────────────────────────────────────────────────────────────
-_REPO = Path(__file__).resolve().parent.parent
-_CV   = _REPO / "CV"
+_NEMO = Path(__file__).resolve().parent
+_CV   = _NEMO.parent / "CV"
 sys.path.insert(0, str(_CV))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_NEMO))
 
-import pipeline                    # noqa: E402
-from exercise_identifier import identify_exercise  # noqa: E402
+from exercise_identifier import identify_exercise, _s3d  # noqa: E402
 from patient_profile import seed_db, get_patient_profile  # noqa: E402
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test exercise_identifier end-to-end")
-    parser.add_argument("--patient", default="P001", help="Patient ID (default: P001)")
-    parser.add_argument(
-        "--video",
-        default="data/videos/squat/squat_10.mp4",
-        help="Query video path (relative to NemoDemo/ or absolute)",
-    )
-    parser.add_argument(
-        "--reference-dir",
-        default=None,
-        help="Override reference video dir (default: NemoDemo/data/videos)",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--patient", default="P001")
+    parser.add_argument("--video", default="data/videos/squat/squat_10.mp4")
     args = parser.parse_args()
 
     video_path = Path(args.video)
     if not video_path.is_absolute():
-        video_path = Path(__file__).resolve().parent / video_path
+        video_path = _NEMO / video_path
     if not video_path.exists():
         sys.exit(f"Video not found: {video_path}")
 
-    # ── setup ──────────────────────────────────────────────────────────────────
     seed_db()
     profile = get_patient_profile(args.patient)
     if profile is None:
         sys.exit(f"Unknown patient: {args.patient}")
 
-    print(f"\nPatient        : {profile.id} — {profile.name}")
-    print(f"Prescribed     : {profile.exercises}")
-    print(f"Query video    : {video_path.name}")
-    print()
+    print(f"\nPatient     : {profile.id} — {profile.name}")
+    print(f"Prescribed  : {profile.exercises}")
+    print(f"Query video : {video_path.name}\n")
 
-    # ── step 1: warm models ────────────────────────────────────────────────────
-    # keypoint_extraction.py resolves pose_landmarker_full.task relative to cwd,
-    # so we must be in the CV directory when loading models.
-    import os
-    os.chdir(_CV)
-    print("Loading models (first run downloads S3D weights ~32 MB)...")
+    print("Loading S3D model...")
     t0 = time.time()
-    pipeline.preload_models()
-    print(f"  models ready in {time.time()-t0:.1f}s\n")
+    import os; os.chdir(_CV)   # keypoint_extraction looks for .task file relative to cwd
+    _s3d()
+    print(f"  ready in {time.time()-t0:.1f}s\n")
 
-    # ── step 2: scan to get track_id ──────────────────────────────────────────
-    print(f"Scanning '{video_path.name}' for persons...")
-    t0 = time.time()
-    persons = pipeline.scan_persons(str(video_path))
-    print(f"  scan done in {time.time()-t0:.1f}s")
-
-    if not persons:
-        sys.exit("No persons detected in the video.")
-
-    for p in persons:
-        status = "NEW  " if p["is_new"] else "known"
-        print(f"  track {p['track_id']:3d}  [{status}]  confidence={p['confidence']:.3f}")
-
-    track_id = persons[0]["track_id"]
-    print(f"\nUsing track_id={track_id}\n")
-
-    # ── step 3: identify exercise ──────────────────────────────────────────────
     print("Running identify_exercise...")
     t0 = time.time()
-    result = identify_exercise(args.patient, str(video_path), track_id)
+    result = identify_exercise(args.patient, str(video_path))
     elapsed = time.time() - t0
 
     print(f"\n{'─'*50}")
-    print(f"Result   : {result or 'None (identification failed)'}")
-    print(f"Time     : {elapsed:.1f}s")
+    print(f"Result  : {result or 'None (identification failed)'}")
+    print(f"Time    : {elapsed:.1f}s")
     print(f"{'─'*50}\n")
 
 
