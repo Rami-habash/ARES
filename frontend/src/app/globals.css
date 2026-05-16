@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* Solstice palette — warm cream + burnt orange accent */
+  --color-sidebar: #1a1208;
+  --color-workspace: #f2ece0;
+  --color-card: #faf7f2;
+  --color-border: #e0d8cc;
+  --color-text-primary: #1a1208;
+  --color-text-muted: #7a6e60;
+  --color-accent-green: #2d7a4f;
+  --color-accent-amber: #c45c1a;
+  --color-accent-red: #c0392b;
+  --color-accent-blue: #1a1208;
+  --color-accent-orange: #e8622c;
+  --color-pill-stable: #d4edda;
+  --color-pill-review: #fdebd0;
+  --color-pill-risk: #fce4e4;
+  --color-diff-good: #edf7f0;
+  --color-diff-bad: #fdf0ef;
+
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--color-workspace);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-border);
+  border-radius: 9999px;
+}
