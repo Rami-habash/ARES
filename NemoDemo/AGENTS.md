@@ -23,7 +23,7 @@ Examples:
 ```
 [form_monitor] exercise_identified | patient=P001 | exercise=squat
 [form_monitor] patient_paused | patient=P001 | was=squat
-[form_monitor] form_score | patient=P001 | exercise=squat | score=0.87
+[form_monitor] form_comparison | patient=P001 | exercise=squat | data=<keypoints>
 ```
 
 ### exercise_identified
@@ -34,9 +34,6 @@ The patient just started a recognized exercise. Respond with a brief acknowledgm
 
 The patient stopped moving. Respond with a brief acknowledgment and one sentence of encouragement.
 
-### form_score
+### form_comparison
 
-A form comparison score arrived (0 = poor, 1 = perfect match to reference).
-- Score ≥ 0.85: brief positive reinforcement.
-- Score 0.65–0.84: one specific correction.
-- Score < 0.65: two corrections, keep tone constructive.
+Comparison data has arrived from the motion analysis system. The `data` field contains keypoints or joint data comparing the patient's live movement against the reference. Analyze the data and give the patient specific, actionable coaching feedback in 1–3 sentences.

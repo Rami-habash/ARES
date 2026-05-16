@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import time
+
 import cv2
 import numpy as np
 
@@ -48,6 +50,9 @@ logger = logging.getLogger(__name__)
 # sampled frames. Below this → considered stationary.
 MOTION_THRESHOLD     = 0.012
 MOTION_SAMPLE_FRAMES = 6
+
+# How often (seconds) to forward comparison data to the agent while monitoring.
+COMPARISON_INTERVAL_SECS = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +113,13 @@ class MotionDetector:
 # Form comparator — STUB
 # ---------------------------------------------------------------------------
 
-def compare_to_reference(clip_path: str, exercise_name: str) -> float | None:
+def compare_to_reference(clip_path: str, exercise_name: str) -> object | None:
     """Compare patient clip to reference videos for *exercise_name*.
 
-    TODO: implementation is owned by another teammate. Should return a form
-    quality score (e.g. cosine similarity, DTW-aligned joint deviation, or a
-    coaching-friendly 0-1 score). Returning None here keeps the daemon
-    operational while the real implementation lands.
+    TODO: implementation is owned by another teammate. Return value can be
+    any structure the comparator produces — keypoints, joint deviations,
+    multi-frame trajectories, etc. Returning None keeps the daemon operational
+    while the real implementation lands.
     """
     return None
 
@@ -130,20 +135,16 @@ class State(Enum):
 
 
 class Event(Enum):
-    """Events worth waking the agent for. Anything not in this set is silent.
-
-    The comparator owner can add additional events (e.g. FORM_BELOW_THRESHOLD,
-    REP_COMPLETED) when compare_to_reference is implemented.
-    """
     PATIENT_PAUSED      = "patient_paused"       # motion stopped — exercise boundary
     EXERCISE_IDENTIFIED = "exercise_identified"  # new exercise classified after motion
+    FORM_COMPARISON     = "form_comparison"      # periodic comparison data for agent analysis
 
 
 @dataclass
 class TickResult:
     state:      State
     exercise:   str | None
-    form_score: float | None
+    comparison: object | None    # raw output of compare_to_reference (any structure)
     event:      Event | None     # set when the agent should be notified
     note:       str              # human-readable summary for logs
 
@@ -156,6 +157,7 @@ class FormMonitor:
         self.state      = State.WAITING
         self.current_exercise: str | None = None
         self._motion    = MotionDetector()
+        self._last_comparison_notify: float = 0.0
 
     def tick(self, clip_path: str) -> TickResult:
         moving = self._motion.is_moving(clip_path)
@@ -164,12 +166,13 @@ class FormMonitor:
         if not moving:
             if self.state != State.WAITING:
                 prev = self.state
-                self.state            = State.WAITING
-                self.current_exercise = None
+                self.state                   = State.WAITING
+                self.current_exercise        = None
+                self._last_comparison_notify = 0.0
                 return TickResult(
                     state=State.WAITING,
                     exercise=None,
-                    form_score=None,
+                    comparison=None,
                     event=Event.PATIENT_PAUSED,
                     note=f"patient paused (was {prev.value})",
                 )
@@ -187,12 +190,13 @@ class FormMonitor:
                                   f"identify error: {e}")
 
             if ex:
-                self.current_exercise = ex
-                self.state            = State.MONITORING
+                self.current_exercise        = ex
+                self.state                   = State.MONITORING
+                self._last_comparison_notify = 0.0
                 return TickResult(
                     state=State.MONITORING,
                     exercise=ex,
-                    form_score=None,
+                    comparison=None,
                     event=Event.EXERCISE_IDENTIFIED,
                     note=f"identified: {ex}",
                 )
@@ -202,15 +206,27 @@ class FormMonitor:
 
         # ── MONITORING ───────────────────────────────────────────────────────
         try:
-            score = compare_to_reference(clip_path, self.current_exercise)
+            data = compare_to_reference(clip_path, self.current_exercise)
         except Exception as e:
             logger.exception("compare_to_reference failed")
             return TickResult(self.state, self.current_exercise, None, None,
                               f"compare error: {e}")
 
-        note = (
-            f"{self.current_exercise} form score = {score:.4f}"
-            if score is not None
-            else f"{self.current_exercise} (no comparator implemented yet)"
-        )
-        return TickResult(self.state, self.current_exercise, score, None, note)
+        if data is None:
+            return TickResult(self.state, self.current_exercise, None, None,
+                              f"{self.current_exercise} (comparator not yet implemented)")
+
+        now = time.monotonic()
+        due = now - self._last_comparison_notify >= COMPARISON_INTERVAL_SECS
+        if due:
+            self._last_comparison_notify = now
+            return TickResult(
+                state=self.state,
+                exercise=self.current_exercise,
+                comparison=data,
+                event=Event.FORM_COMPARISON,
+                note=f"{self.current_exercise} comparison ready",
+            )
+
+        return TickResult(self.state, self.current_exercise, data, None,
+                          f"{self.current_exercise} monitoring")

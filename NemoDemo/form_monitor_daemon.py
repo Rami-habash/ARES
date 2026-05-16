@@ -149,8 +149,12 @@ def _build_event_message(patient_id: str, result: TickResult) -> str:
     if result.event == Event.PATIENT_PAUSED:
         was = result.exercise or "unknown"
         return f"[form_monitor] patient_paused | patient={patient_id} | was={was}"
-    # form_score events (future)
-    return f"[form_monitor] form_score | patient={patient_id} | exercise={result.exercise} | score={result.form_score:.4f}"
+    if result.event == Event.FORM_COMPARISON:
+        return (
+            f"[form_monitor] form_comparison | patient={patient_id} | exercise={result.exercise} | "
+            f"data={result.comparison}"
+        )
+    return f"[form_monitor] unknown_event | patient={patient_id}"
 
 
 async def default_agent_callback(patient_id: str, result: TickResult):
