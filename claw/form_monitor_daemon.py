@@ -191,7 +191,25 @@ async def default_agent_callback(patient_id: str, result: TickResult):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _clear_agent_session():
+    """Delete accumulated session history so each daemon run starts fresh."""
+    cmd = [
+        "openshell", "-g", "nemoclaw",
+        "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",
+        "sh", "-c",
+        "rm -f /sandbox/.openclaw/agents/main/sessions/*.jsonl "
+        "/sandbox/.openclaw/agents/main/sessions/*.trajectory-path.json "
+        "/sandbox/.openclaw/agents/main/sessions/*.trajectory.jsonl",
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        logger.info("Agent session cleared.")
+    except Exception:
+        logger.warning("Could not clear agent session; continuing anyway.")
+
+
 async def run(patient_id: str, source: int | str, agent_callback=default_agent_callback):
+    _clear_agent_session()
     monitor    = FormMonitor(patient_id)
     clip_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
     stop_event = asyncio.Event()
