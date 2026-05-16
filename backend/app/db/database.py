@@ -88,4 +88,27 @@ def init_db(path: Path = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_gym_sessions_patient
                 ON gym_sessions(patient_id, started_at);
+
+            -- Frequency table for the "common exercises" model. patient_exercises
+            -- is recomputed from the top-3 of this table.
+            CREATE TABLE IF NOT EXISTS patient_exercise_counts (
+                patient_id    TEXT    NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+                exercise_name TEXT    NOT NULL,
+                session_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (patient_id, exercise_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ex_counts_patient
+                ON patient_exercise_counts(patient_id, session_count DESC);
         """)
+
+        # ALTER TABLE outside executescript so each can fail independently
+        # when the column already exists (idempotent migration).
+        for stmt in (
+            "ALTER TABLE patients ADD COLUMN doctor_note TEXT",
+            "ALTER TABLE patients ADD COLUMN risk_profile_json TEXT",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass

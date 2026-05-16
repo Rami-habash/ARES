@@ -115,14 +115,20 @@ class MotionDetector:
 
 import form_analysis  # noqa: E402 — CV dir already on sys.path above
 
-_VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
-_ref_kp_cache: dict[str, list[list[dict]]] = {}   # exercise_name → landmarks
+import embedding_cache as _emb_cache  # noqa: E402
+
+_VIDEO_ROOT = Path(__file__).resolve().parent / "data" / "videos"
+
+# Keypoint sequences are ~few MB each; cap at 10 exercises (one full gym
+# prescription plus a few OOD extras) and evict least-frequently-used.
+_ref_kp_lfu = _emb_cache._LFUCache(10)   # str → list[list[dict]]
 
 
 def _reference_keypoints(pose_model, exercise_name: str) -> list[list[dict]] | None:
-    """Extract (and cache) keypoints from the first reference video for an exercise."""
-    if exercise_name in _ref_kp_cache:
-        return _ref_kp_cache[exercise_name]
+    """Extract (and LFU-cache) keypoints from the first reference video."""
+    cached = _ref_kp_lfu.get(exercise_name)
+    if cached is not None:
+        return cached
 
     ref_dir = _VIDEO_ROOT / exercise_name
     if not ref_dir.is_dir():
@@ -137,7 +143,7 @@ def _reference_keypoints(pose_model, exercise_name: str) -> list[list[dict]] | N
     lms = form_analysis.extract_reference_keypoints(
         pose_model, str(ref_videos[0]), bbox_model=None, num_frames=64
     )
-    _ref_kp_cache[exercise_name] = lms
+    _ref_kp_lfu.put(exercise_name, lms)
     return lms
 
 

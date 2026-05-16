@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,8 +11,17 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parents[3]   # repo root
 
-# Single combined DB — clinical + app data in one place
-DB_PATH = ROOT_DIR / "claw" / "data" / "patients.db"
+# Make the claw package importable from the backend so KAGGLE_EXERCISES and
+# friends have a single source of truth (claw/patient_profile/profile.py).
+_CLAW_DIR = ROOT_DIR / "claw"
+if str(_CLAW_DIR) not in sys.path:
+    sys.path.insert(0, str(_CLAW_DIR))
+
+# Single combined DB — clinical + app data in one place.
+# ARES_DB_PATH override lets tests redirect to a temp file before app import.
+DB_PATH = Path(
+    os.environ.get("ARES_DB_PATH", str(ROOT_DIR / "claw" / "data" / "patients.db"))
+)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SECRET_KEY       = os.environ.get("SECRET_KEY", "CHANGE_ME_IN_PRODUCTION_please")

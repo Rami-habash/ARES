@@ -27,8 +27,10 @@ triggers the OOD path when a patient does something outside their prescription.
 
 Embedding cache
 ---------------
-Reference embeddings are cached as .pt files under data/embeddings/ so
-subsequent runs are near-instant for already-seen videos.
+Reference embeddings are served from a RAM-resident LFU cache backed by
+.pt files under data/embeddings/.  On patient check-in call
+embedding_cache.prefetch_for_patient() to pre-warm the RAM cache so the
+first identification hit never touches disk.
 """
 
 from __future__ import annotations
@@ -41,7 +43,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from openai import OpenAI
 
@@ -52,6 +53,7 @@ if str(_CV_DIR) not in sys.path:
 import video_embeder  # noqa: E402
 
 from patient_profile import KAGGLE_EXERCISES, get_patient_profile  # noqa: E402
+import embedding_cache  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,6 @@ logger = logging.getLogger(__name__)
 THRESHOLD         = 0.75
 REFS_PER_EXERCISE = 5
 VIDEO_ROOT        = Path(__file__).resolve().parent / "data" / "videos"
-EMBED_CACHE_ROOT  = Path(__file__).resolve().parent / "data" / "embeddings"
 
 NVIDIA_API_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -82,26 +83,12 @@ def _s3d():
 
 
 # ---------------------------------------------------------------------------
-# Embedding helpers (with disk cache)
+# Embedding helpers (RAM LFU → disk → S3D)
 # ---------------------------------------------------------------------------
 
-def _cache_path(video_path: Path) -> Path:
-    try:
-        rel = video_path.relative_to(VIDEO_ROOT)
-    except ValueError:
-        rel = Path(video_path.name)
-    return EMBED_CACHE_ROOT / rel.parent / (rel.stem + ".pt")
-
-
 def _embed(video_path: Path) -> np.ndarray:
-    """S3D embed a video, reading from disk cache if available."""
-    cache = _cache_path(video_path)
-    if cache.exists():
-        return torch.load(cache, weights_only=True).numpy()
-    emb = video_embeder.embed(_s3d(), str(video_path))
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(torch.from_numpy(emb), cache)
-    return emb
+    """Return S3D embedding via the RAM LFU cache (see embedding_cache.py)."""
+    return embedding_cache.get_embedding(video_path, _s3d())
 
 
 def _exercise_has_videos(exercise_name: str) -> bool:

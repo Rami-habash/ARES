@@ -32,15 +32,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import ALLOWED_ORIGINS
+from app.core.config import ALLOWED_ORIGINS, DB_PATH
 from app.db.database import init_db
 from app.db.seed import seed
+from patient_profile.profile import init_db as init_claw_db
 from app.routers import ai, alerts, auth, gym, patients, sessions, users
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Ensure schema exists; seed only if users table is empty.
+    init_claw_db(DB_PATH)
     init_db()
     from app.db.database import get_conn
     with get_conn() as conn:

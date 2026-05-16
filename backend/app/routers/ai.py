@@ -43,7 +43,7 @@ def _admin_context(query: str) -> str:
                     "WHERE pe.patient_id=?", (p["id"],)
                 )
             ]
-            rows.append(f"Patient {p['id']} ({p['name']}): {p['notes']}. Exercises: {', '.join(exercises)}")
+            rows.append(f"Patient {p['id']} ({p['name']}): {p['notes']}. Common exercises: {', '.join(exercises)}")
 
         alerts = conn.execute(
             "SELECT patient_id, severity, title, description FROM alerts WHERE status='Open' LIMIT 20"
@@ -99,7 +99,7 @@ def _patient_context(user_id: int) -> tuple[str, str | None]:
     if row:
         patient_info = (
             f"Patient: {row['name']}\nNotes: {row['notes']}\n"
-            f"Prescribed exercises: {', '.join(exercises)}\n"
+            f"Common exercises: {', '.join(exercises)}\n"
             "Recent session highlights:\n" + "\n".join(f"- {m}" for m in memories)
         )
 

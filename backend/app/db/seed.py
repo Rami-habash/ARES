@@ -1,7 +1,7 @@
 """Seed the combined DB with all demo data in one pass.
 
-Clinical data (patients, exercises, prescriptions) and app data (users,
-alerts, sessions) all go into the same DB at NemoDemo/data/patients.db.
+Clinical data (patients, exercises, common-exercise counts) and app data
+(users, alerts, sessions) all go into the same DB at claw/data/patients.db.
 
 Usage:
   cd backend && python -m app.db.seed           # safe to re-run (INSERT OR IGNORE)
@@ -19,41 +19,37 @@ from __future__ import annotations
 import json
 import sys
 
+# app.core.config injects claw/ onto sys.path so this import resolves.
+from app.core.config import DB_PATH  # noqa: F401  (also triggers path setup)
 from app.core.security import hash_password
 from app.db.database import get_conn, init_db
+from patient_profile.profile import (
+    KAGGLE_EXERCISES,
+    _refresh_common_exercises,
+    init_db as init_claw_db,
+)
 
 # ── Clinical data ─────────────────────────────────────────────────────────────
 
-KAGGLE_EXERCISES: tuple[str, ...] = (
-    "barbell biceps curl", "bench press", "chest fly machine", "deadlift",
-    "decline bench press", "hammer curl", "hip thrust", "incline bench press",
-    "lat pulldown", "lateral raise", "leg extension", "leg raises", "plank",
-    "pull up", "push-up", "romanian deadlift", "russian twist", "shoulder press",
-    "squat", "t bar row", "tricep dips", "tricep pushdown",
+DEMO_PATIENTS = (
+    {"id": "P001", "name": "Alice Nguyen",   "date_of_birth": "1987-04-12",
+     "notes": "Post-ACL reconstruction, week 8. Avoid heavy axial load."},
+    {"id": "P002", "name": "Marcus Reed",    "date_of_birth": "1972-11-30",
+     "notes": "Rotator cuff repair, week 12. Cleared for light pressing."},
+    {"id": "P003", "name": "Priya Shah",     "date_of_birth": "1995-02-08",
+     "notes": "Chronic lower-back pain. Core stability focus."},
+    {"id": "P004", "name": "Diego Alvarez",  "date_of_birth": "1960-07-21",
+     "notes": "General deconditioning post-hospitalization. Build baseline."},
 )
 
-DEMO_PATIENTS = (
-    {
-        "id": "P001", "name": "Alice Nguyen", "date_of_birth": "1987-04-12",
-        "notes": "Post-ACL reconstruction, week 8. Avoid heavy axial load.",
-        "exercises": ("squat", "leg extension", "hip thrust", "plank"),
-    },
-    {
-        "id": "P002", "name": "Marcus Reed", "date_of_birth": "1972-11-30",
-        "notes": "Rotator cuff repair, week 12. Cleared for light pressing.",
-        "exercises": ("shoulder press", "lateral raise", "lat pulldown", "push-up"),
-    },
-    {
-        "id": "P003", "name": "Priya Shah", "date_of_birth": "1995-02-08",
-        "notes": "Chronic lower-back pain. Core stability focus.",
-        "exercises": ("plank", "russian twist", "romanian deadlift", "hip thrust"),
-    },
-    {
-        "id": "P004", "name": "Diego Alvarez", "date_of_birth": "1960-07-21",
-        "notes": "General deconditioning post-hospitalization. Build baseline.",
-        "exercises": ("squat", "push-up", "lat pulldown", "leg raises", "plank"),
-    },
-)
+# Keep in sync with claw/patient_profile/profile.py:DEMO_EXERCISE_COUNTS.
+# patient_exercises is derived as top-3 by count.
+DEMO_EXERCISE_COUNTS = {
+    "P001": {"squat": 10, "hip thrust": 9, "leg extension": 8, "plank": 7},
+    "P002": {"shoulder press": 11, "lateral raise": 9, "lat pulldown": 7, "push-up": 5},
+    "P003": {"plank": 12, "russian twist": 10, "romanian deadlift": 6, "hip thrust": 4},
+    "P004": {"squat": 8, "push-up": 7, "lat pulldown": 6, "leg raises": 5, "plank": 3},
+}
 
 # ── App data ──────────────────────────────────────────────────────────────────
 
@@ -82,13 +78,15 @@ DEMO_SESSIONS = (
 
 
 def seed(reset: bool = False) -> None:
-    init_db()  # adds ARES tables to the existing NemoDemo schema
+    init_claw_db(DB_PATH)   # patients, exercises, patient_exercises, counts
+    init_db()               # ARES tables (users, alerts, session_logs, …)
 
     with get_conn() as conn:
         if reset:
             conn.executescript(
                 "DELETE FROM session_logs; DELETE FROM alerts; "
                 "DELETE FROM patient_links; DELETE FROM users; "
+                "DELETE FROM patient_exercise_counts; "
                 "DELETE FROM patient_exercises; DELETE FROM session_memories; "
                 "DELETE FROM patients; DELETE FROM exercises;"
             )
@@ -103,12 +101,14 @@ def seed(reset: bool = False) -> None:
                 "INSERT OR IGNORE INTO patients(id, name, date_of_birth, notes) VALUES (?, ?, ?, ?)",
                 (p["id"], p["name"], p["date_of_birth"], p["notes"]),
             )
-            for ex_name in p["exercises"]:
+            counts = DEMO_EXERCISE_COUNTS.get(p["id"], {})
+            for ex_name, count in counts.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO patient_exercises(patient_id, exercise_id) "
-                    "SELECT ?, id FROM exercises WHERE name = ?",
-                    (p["id"], ex_name),
+                    "INSERT OR IGNORE INTO patient_exercise_counts(patient_id, exercise_name, session_count) "
+                    "VALUES (?, ?, ?)",
+                    (p["id"], ex_name, count),
                 )
+            _refresh_common_exercises(p["id"], conn)
 
         # App data
         for u in DEMO_USERS:

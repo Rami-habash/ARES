@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 
 from form_monitor import Event, FormMonitor, TickResult
-from patient_profile.profile import add_session_memory
+from patient_profile.profile import add_session_memory, increment_exercise_count
 
 logger = logging.getLogger("form_monitor_daemon")
 
@@ -378,6 +378,18 @@ async def default_agent_callback(patient_id: str, result: TickResult):
     except Exception:
         logger.exception("agent_callback: openclaw call failed")
 
+    # Record the completed exercise in the patient's frequency table so the
+    # top-3 common exercises refresh in real time. Use result.exercise directly
+    # — never the "unknown" fallback used above — so phantom rows don't poison
+    # the count table.
+    if result.event == Event.PATIENT_PAUSED and result.exercise:
+        try:
+            await asyncio.to_thread(
+                increment_exercise_count, patient_id, result.exercise,
+            )
+        except Exception:
+            logger.exception("increment_exercise_count failed")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -476,6 +488,13 @@ def _clear_agent_session():
 async def run(patient_id: str, source: int | str, agent_callback=default_agent_callback):
     _clear_agent_session()
     monitor    = FormMonitor(patient_id)
+
+    # Pre-warm the RAM embedding cache for the patient's prescribed exercises
+    # so the first identify_exercise call never blocks on disk or S3D compute.
+    import embedding_cache as _emb_cache
+    from exercise_identifier import _s3d as _get_s3d
+    await asyncio.to_thread(_emb_cache.prefetch_for_patient, patient_id, _get_s3d())
+
     clip_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
     stop_event = asyncio.Event()
 
