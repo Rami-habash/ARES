@@ -162,8 +162,11 @@ def _ask_nemotron(prompt: str) -> list[str]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
+def identify_exercise(patient_id: str, query_video_path: str, track_id: int) -> str | None:
     """Identify the exercise being performed in *query_video_path*.
+
+    track_id must come from pipeline.scan_persons called on the same video
+    immediately before this function.
 
     Returns the matched exercise name, or None only if reference videos are
     missing for all candidates (should not happen in a properly seeded setup).
@@ -186,7 +189,7 @@ def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
     if in_domain:
         result = pipeline.classify_movement(
             query_video_path,
-            track_id=0,
+            track_id=track_id,
             reference_dir=str(VIDEO_ROOT),
             min_confidence=THRESHOLD,
         )
@@ -253,7 +256,7 @@ def identify_exercise(patient_id: str, query_video_path: str) -> str | None:
 
             result = pipeline.classify_movement(
                 query_video_path,
-                track_id=0,
+                track_id=track_id,
                 reference_dir=str(scratch),
                 min_confidence=THRESHOLD,
             )
