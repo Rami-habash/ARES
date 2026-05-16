@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -130,24 +131,56 @@ async def process_loop(
 
         if result.event is not None:
             try:
-                await agent_callback(result)
+                await agent_callback(monitor.patient_id, result)
             except Exception:
                 logger.exception("agent_callback raised; continuing")
 
 
 # ---------------------------------------------------------------------------
-# Default agent callback — stub. Wire to NemoClaw transport when known.
+# Agent callback — sends events to the OpenClaw agent via openclaw CLI.
 # ---------------------------------------------------------------------------
 
-async def default_agent_callback(result: TickResult):
-    payload = {
-        "event":      result.event.value,
-        "state":      result.state.value,
-        "exercise":   result.exercise,
-        "form_score": result.form_score,
-        "note":       result.note,
-    }
-    print(f"  → AGENT NOTIFY: {payload}")
+OPENCLAW_SANDBOX  = "nemo-ares"
+OPENCLAW_SESSION  = "+10000000001"   # fixed number → stable session key
+
+def _build_event_message(patient_id: str, result: TickResult) -> str:
+    if result.event == Event.EXERCISE_IDENTIFIED:
+        return f"[form_monitor] exercise_identified | patient={patient_id} | exercise={result.exercise}"
+    if result.event == Event.PATIENT_PAUSED:
+        was = result.exercise or "unknown"
+        return f"[form_monitor] patient_paused | patient={patient_id} | was={was}"
+    # form_score events (future)
+    return f"[form_monitor] form_score | patient={patient_id} | exercise={result.exercise} | score={result.form_score:.4f}"
+
+
+async def default_agent_callback(patient_id: str, result: TickResult):
+    msg = _build_event_message(patient_id, result)
+    print(f"  → AGENT: {msg!r}")
+    cmd = [
+        "openshell", "-g", "nemoclaw",
+        "sandbox", "exec", "-n", OPENCLAW_SANDBOX, "--",
+        "openclaw", "agent",
+        "--to", OPENCLAW_SESSION,
+        "--message", msg,
+        "--json",
+    ]
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd,
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            import json
+            try:
+                data = json.loads(proc.stdout)
+                reply = data.get("result", {}).get("payloads", [{}])[0].get("text", "")
+                print(f"  ← AGENT: {reply}")
+            except Exception:
+                print(f"  ← AGENT (raw): {proc.stdout[:200]}")
+        else:
+            logger.warning("openclaw agent exited %d: %s", proc.returncode, proc.stderr[:200])
+    except Exception:
+        logger.exception("agent_callback: openclaw call failed")
 
 
 # ---------------------------------------------------------------------------

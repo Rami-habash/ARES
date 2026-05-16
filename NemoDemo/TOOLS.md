@@ -15,4 +15,15 @@ Fetches current date and time from the system clock using the `date` command. No
 
 ---
 
-<!-- Add new tools below this line as you install them -->
+## form_monitor
+
+**Source:** `NemoDemo/form_monitor_daemon.py` (runs on host, pushes events via `openclaw agent`)
+
+Monitors a webcam feed and pushes structured events to this agent when a patient starts or stops an exercise.
+
+**Events pushed:**
+- `exercise_identified` — motion detected and classified
+- `patient_paused` — patient stopped moving
+- `form_score` — per-tick form quality score (once comparator is implemented)
+
+No commands to run — events arrive as inbound messages.
