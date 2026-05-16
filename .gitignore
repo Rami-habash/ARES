@@ -7,3 +7,5 @@ NemoDemo/data/*.db
 *.npy
 *.json
 NemoDemo/data/videos/
+you-are-an-expert-refactored-wilkes.md
+backend/.env
