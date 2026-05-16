@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import subprocess
 import tempfile
 import time
+import wave
 from pathlib import Path
 
 import cv2
@@ -137,6 +139,91 @@ async def process_loop(
 
 
 # ---------------------------------------------------------------------------
+# Text-to-speech via NVIDIA Magpie (Riva gRPC)
+# ---------------------------------------------------------------------------
+
+RIVA_SERVER      = "grpc.nvcf.nvidia.com:443"
+RIVA_FUNCTION_ID = "877104f7-e885-42b9-8de8-f6e4c6303969"
+RIVA_VOICE       = "Magpie-Multilingual.EN-US.Aria"
+RIVA_SAMPLE_RATE = 22050
+
+
+def _speak_blocking(text: str) -> None:
+    api_key = os.environ.get("NVIDIA_API_KEY", "")
+    if not api_key or not text:
+        return
+
+    import riva.client
+
+    auth = riva.client.Auth(
+        uri=RIVA_SERVER,
+        use_ssl=True,
+        metadata_args=[
+            ["function-id", RIVA_FUNCTION_ID],
+            ["authorization", f"Bearer {api_key}"],
+        ],
+    )
+    tts = riva.client.SpeechSynthesisService(auth)
+    response = tts.synthesize(
+        text,
+        voice_name=RIVA_VOICE,
+        language_code="en-US",
+        sample_rate_hz=RIVA_SAMPLE_RATE,
+    )
+
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit PCM
+            wf.setframerate(RIVA_SAMPLE_RATE)
+            wf.writeframes(response.audio)
+        subprocess.run(["aplay", "-q", wav_path], timeout=30)
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+
+async def speak(text: str) -> None:
+    try:
+        await asyncio.to_thread(_speak_blocking, text)
+    except Exception:
+        logger.exception("TTS failed")
+
+
+# ---------------------------------------------------------------------------
+# WebSocket broadcast server — pushes coaching text to the frontend.
+# ---------------------------------------------------------------------------
+
+WS_PORT = 8765
+_ws_clients: set = set()
+
+
+async def _ws_handler(websocket) -> None:
+    _ws_clients.add(websocket)
+    logger.info("Frontend connected (total=%d)", len(_ws_clients))
+    try:
+        await websocket.wait_closed()
+    finally:
+        _ws_clients.discard(websocket)
+        logger.info("Frontend disconnected (total=%d)", len(_ws_clients))
+
+
+async def broadcast_coaching(patient_id: str, text: str) -> None:
+    """Send a coaching message to all connected frontend clients."""
+    if not _ws_clients:
+        return
+    payload = json.dumps({"patient_id": patient_id, "text": text})
+    await asyncio.gather(
+        *[ws.send(payload) for ws in list(_ws_clients)],
+        return_exceptions=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent callback — sends events to the OpenClaw agent via openclaw CLI.
 # ---------------------------------------------------------------------------
 
@@ -179,6 +266,7 @@ async def default_agent_callback(patient_id: str, result: TickResult):
                 data = json.loads(proc.stdout)
                 reply = data.get("result", {}).get("payloads", [{}])[0].get("text", "")
                 print(f"  ← AGENT: {reply}")
+                await broadcast_coaching(patient_id, reply)
             except Exception:
                 print(f"  ← AGENT (raw): {proc.stdout[:200]}")
         else:
@@ -214,10 +302,13 @@ async def run(patient_id: str, source: int | str, agent_callback=default_agent_c
     clip_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
     stop_event = asyncio.Event()
 
-    await asyncio.gather(
-        capture_loop(source, clip_queue, stop_event),
-        process_loop(monitor, clip_queue, agent_callback, stop_event),
-    )
+    import websockets
+    async with websockets.serve(_ws_handler, "0.0.0.0", WS_PORT):
+        logger.info("Coaching WebSocket listening on ws://0.0.0.0:%d", WS_PORT)
+        await asyncio.gather(
+            capture_loop(source, clip_queue, stop_event),
+            process_loop(monitor, clip_queue, agent_callback, stop_event),
+        )
 
 
 def main():
