@@ -6,6 +6,6 @@ NemoDemo/data/*.db
 *.pt
 *.npy
 *.json
-NemoDemo/data/videos/
+claw/data/videos/
 you-are-an-expert-refactored-wilkes.md
 backend/.env

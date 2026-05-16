@@ -219,8 +219,12 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # Cast --source: int if it's a digit, else use as a file path.
-    source: int | str = int(args.source) if args.source.isdigit() else args.source
+    # Cast --source: int if it's a digit, else resolve as a file path
+    # (must happen BEFORE chdir, otherwise the relative path breaks).
+    if args.source.isdigit():
+        source: int | str = int(args.source)
+    else:
+        source = str(Path(args.source).resolve())
 
     # keypoint_extraction looks for pose_landmarker_full.task relative to cwd.
     os.chdir(Path(__file__).resolve().parent.parent / "CV")
