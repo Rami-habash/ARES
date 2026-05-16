@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SANDBOX="nemo-ares"
-SNAPSHOT="with-solstice-workspace-v3"
+SNAPSHOT="with-solstice-workspace-v4"
 
 echo "Restoring $SANDBOX from snapshot '$SNAPSHOT'..."
 nemoclaw "$SANDBOX" snapshot restore "$SNAPSHOT"
