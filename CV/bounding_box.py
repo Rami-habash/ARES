@@ -21,9 +21,6 @@ def load_model(model_name: str = DEFAULT_MODEL):
 
 
 def extract_bounding_boxes(model, frame, confidence_threshold: float, tracker: str = _TRACKER_CONFIG):
-    # imgsz=640 is YOLO's default training resolution; halving the frame here
-    # cuts per-call latency significantly without hurting detection quality
-    # for upper-body framed people.
     results = model.track(
         frame,
         persist=True,
@@ -32,7 +29,6 @@ def extract_bounding_boxes(model, frame, confidence_threshold: float, tracker: s
         iou=0.45,
         tracker=tracker,
         verbose=False,
-        imgsz=640,
         half=True,
     )
     return results[0].boxes if results and results[0].boxes is not None else []
