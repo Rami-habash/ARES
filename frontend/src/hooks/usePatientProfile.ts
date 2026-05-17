@@ -1,6 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { API_BASE } from '@/lib/config'
+import { authHeaders } from '@/lib/api/auth'
 
 export interface SessionMemory {
   created_at: string
@@ -47,7 +48,9 @@ export function usePatientProfile(patientId: string | null) {
     let cancelled = false
     ;(async () => {
       try {
-        const res = await fetch(`${API_BASE}/patients/${patientId}`)
+        const res = await fetch(`${API_BASE}/patients/${patientId}`, {
+          headers: authHeaders(),
+        })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = (await res.json()) as PatientProfile
         if (!cancelled) setProfile(data)
