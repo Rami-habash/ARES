@@ -228,7 +228,7 @@ def _start_daemon(patient_id: str) -> None:
     env = {**os.environ, "PYTHONPATH": str(_DAEMON_CV_DIR)}
     proc = subprocess.Popen(
         ["python3", str(_DAEMON_SCRIPT), "--patient", patient_id,
-         "--source", "http://localhost:8001/live/mjpeg"],
+         "--source", "http://localhost:8001/live/mjpeg?stream=detail"],
         cwd=str(_DAEMON_CV_DIR),
         env=env,
     )
