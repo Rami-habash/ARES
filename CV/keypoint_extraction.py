@@ -27,8 +27,17 @@ def load_model(confidence: float = DEFAULT_CONFIDENCE):
         url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
         urllib.request.urlretrieve(url, MODEL_PATH)
 
+    # Try GPU delegate; fall back to CPU if MediaPipe's GPU build isn't available.
+    try:
+        base = mp_tasks.BaseOptions(
+            model_asset_path=MODEL_PATH,
+            delegate=mp_tasks.BaseOptions.Delegate.GPU,
+        )
+    except Exception:
+        base = mp_tasks.BaseOptions(model_asset_path=MODEL_PATH)
+
     options = PoseLandmarkerOptions(
-        base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=base,
         running_mode=RunningMode.IMAGE,
         num_poses=1,
         min_pose_detection_confidence=confidence,

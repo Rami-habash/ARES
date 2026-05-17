@@ -181,16 +181,15 @@ class LiveSession:
 
     def _run_stream(self, worker: _StreamWorker) -> None:
         bbox_model = pipeline._bbox()
-        # Detail stream: pose on every track. Security stream: pose only on
-        # tracks already bound to a patient_id (Exercise Detail consumes these
-        # keypoints for its target-patient skeleton overlay).
-        pose_all_tracks = worker.name != SECURITY_STREAM
+        # Both streams: pose only on tracks already bound to a patient_id. The
+        # detail view shows one patient at a time, and running pose on every
+        # bystander YOLO sees was the main detail-stream bottleneck.
+        pose_all_tracks = False
         pipeline._pose()  # warm regardless — both streams may run pose
 
         # Run YOLO every frame; run MediaPipe every POSE_STRIDE frames and
         # carry the previous keypoints forward for the skipped frames.
-        # Detail stream needs higher stride because it runs pose on all tracks.
-        POSE_STRIDE = 2 if worker.name == SECURITY_STREAM else 3
+        POSE_STRIDE = 2
         cached_keypoints: dict[int, list] = {}  # tid → last computed keypoints
 
         log.info("[%s] worker started (pose_all=%s, pose_stride=%d)", worker.name, pose_all_tracks, POSE_STRIDE)
