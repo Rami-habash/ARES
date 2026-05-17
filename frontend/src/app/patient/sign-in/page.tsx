@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { login, getToken, clearToken, googleLoginUrl, savePatientId } from '@/lib/api/auth'
+import { login, getToken, getPatientId, clearToken, googleLoginUrl, savePatientId } from '@/lib/api/auth'
 import { getMyProfile } from '@/lib/api/patients'
 import { USE_MOCK } from '@/lib/config'
 import PatientHeader from '@/components/patient/PatientHeader'
@@ -22,7 +22,15 @@ export default function PatientSignInPage() {
       setError("This Google account isn't linked to a patient profile yet. Try signing in with your email, or contact your physical therapist.")
       return
     }
-    if (getToken()) router.replace('/patient/check-in')
+    // Only auto-redirect if BOTH token and patient_id are present — otherwise
+    // PatientGuard will bounce us right back here and we'll loop.
+    if (getToken() && getPatientId()) {
+      router.replace('/patient/check-in')
+    } else if (getToken() && !getPatientId()) {
+      // Stale token without a linked patient profile — clear it so the user
+      // can sign in cleanly.
+      clearToken()
+    }
   }, [router, params])
 
   const handleSubmit = async (e: React.FormEvent) => {
